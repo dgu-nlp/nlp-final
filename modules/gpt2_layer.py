@@ -29,7 +29,10 @@ class GPT2Layer(nn.Module):
         이 함수에서는 Layer Normalization을 적용하지 않는다.
     """
     ### 완성시켜야 할 빈 코드 블록
-    raise NotImplementedError
+    #raise NotImplementedError
+    transformed = dense_layer(output)      # Linear projection
+    output = dropout(transformed)          # Dropout
+    return input + output             # Residual connection
 
 
   def forward(self, hidden_states, attention_mask):
@@ -42,4 +45,15 @@ class GPT2Layer(nn.Module):
     """
 
     ### 완성시켜야 할 빈 코드 블록
-    raise NotImplementedError
+    #raise NotImplementedError
+    # 1. Self-Attention 서브레이어
+    attention_input = self.attention_layer_norm(hidden_states)
+    attention_output = self.self_attention(attention_input, attention_mask)
+    hidden_states = self.add(hidden_states, attention_output, self.attention_dense, self.attention_dropout)
+
+    # 2. Feed Forward 서브레이어
+    ff_hidden = self.out_layer_norm(hidden_states)
+    ff_output = self.interm_af(self.interm_dense(ff_hidden))
+    hidden_states = self.add(hidden_states, ff_output, self.out_dense, self.out_dropout)
+
+    return hidden_states

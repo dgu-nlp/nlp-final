@@ -57,7 +57,8 @@ class GPT2SentimentClassifier(torch.nn.Module):
     TODO: BERT 임베딩의 감정 분류를 위해 필요한 인스턴스 변수를 생성하시오.
     '''
     ### 완성시켜야 할 빈 코드 블록
-    raise NotImplementedError
+    #raise NotImplementedError
+    self.classifier = torch.nn.Linear(config.hidden_size, config.num_labels)
 
 
   def forward(self, input_ids, attention_mask):
@@ -69,7 +70,15 @@ class GPT2SentimentClassifier(torch.nn.Module):
         적절한 반환값이 무엇인지 생각해보시오.
     '''
     ### 완성시켜야 할 빈 코드 블록
-    raise NotImplementedError
+    #raise NotImplementedError
+    outputs = self.gpt(input_ids=input_ids, attention_mask=attention_mask)
+  
+    # 마지막 토큰의 hidden state 가져오기
+    # outputs.last_hidden_state: [batch_size, seq_len, hidden_size]
+    last_token_indices = attention_mask.sum(dim=1) - 1  # 마지막 실제 토큰 인덱스
+    last_hidden_states = outputs['last_hidden_state'][range(input_ids.size(0)), last_token_indices]
+    logits = self.classifier(last_hidden_states)  # [batch_size, num_labels]
+    return logits
 
 
 class SentimentDataset(Dataset):
@@ -244,7 +253,14 @@ def save_model(model, optimizer, args, config, filepath):
 
 
 def train(args):
-  device = torch.device('cuda') if args.use_gpu else torch.device('cpu')
+  #device = torch.device('cuda') if args.use_gpu else torch.device('cpu')
+  if args.use_gpu and torch.backends.mps.is_available():
+      device = torch.device("mps")
+      print("Using MPS (Apple GPU)")
+  else:
+      device = torch.device("cpu")
+      print("Using CPU")
+
   # 데이터와 해당 데이터셋 및 데이터로더를 만든다.
   train_data, num_labels = load_data(args.train, 'train')
   dev_data = load_data(args.dev, 'valid')
@@ -309,7 +325,13 @@ def train(args):
 
 def test(args):
   with torch.no_grad():
-    device = torch.device('cuda') if args.use_gpu else torch.device('cpu')
+    #device = torch.device('cuda') if args.use_gpu else torch.device('cpu')
+    if args.use_gpu and torch.backends.mps.is_available():
+        device = torch.device("mps")
+        print("Using MPS (Apple GPU)")
+    else:
+        device = torch.device("cpu")
+        print("Using CPU")
     saved = torch.load(args.filepath)
     config = saved['model_config']
     model = GPT2SentimentClassifier(config)

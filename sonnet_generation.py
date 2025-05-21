@@ -132,7 +132,7 @@ def save_model(model, optimizer, args, filepath):
 
 def train(args):
   """Sonnet 데이터셋에서 소넷 생성을 위해 GPT-2 훈련.""" 
-    device = torch.device('cuda') if args.use_gpu else torch.device('cpu')
+  device = torch.device('cuda') if args.use_gpu else torch.device('cpu')
   # 데이터, 해당 데이터셋 및 데이터로드 생성하기.
   sonnet_dataset = SonnetsDataset(args.sonnet_path)
   sonnet_dataloader = DataLoader(sonnet_dataset, shuffle=True, batch_size=args.batch_size,
