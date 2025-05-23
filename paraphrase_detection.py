@@ -70,7 +70,10 @@ class ParaphraseGPT(nn.Module):
     패러프레이즈가 아닌 경우에는 토큰 "no" (BPE index 3919)가 될 것이다.
     """
     ### 완성시켜야 할 빈 코드 블록
-    raise NotImplementedError
+    #raise NotImplementedError
+    
+    last_hidden_state = self.gpt(input_ids, attention_mask)['last_token'] 
+    return self.gpt.hidden_state_to_token(last_hidden_state)
 
 
 
