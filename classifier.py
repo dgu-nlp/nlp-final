@@ -10,6 +10,7 @@ import csv
 
 import torch
 import torch.nn.functional as F
+from torch import nn
 from torch.utils.data import Dataset, DataLoader
 from transformers import GPT2Tokenizer
 from sklearn.metrics import f1_score, accuracy_score
@@ -59,7 +60,7 @@ class GPT2SentimentClassifier(torch.nn.Module):
     ### 완성시켜야 할 빈 코드 블록
     #raise NotImplementedError
     self.classifier = torch.nn.Linear(config.hidden_size, config.num_labels)
-
+    self.droupout = nn.Dropout(config.hidden_dropout_prob)
 
   def forward(self, input_ids, attention_mask):
     '''문장들의 batch를 받아서 감정 클래스에 대한 로짓을 반환'''
@@ -71,12 +72,12 @@ class GPT2SentimentClassifier(torch.nn.Module):
     '''
     ### 완성시켜야 할 빈 코드 블록
     #raise NotImplementedError
-    outputs = self.gpt(input_ids=input_ids, attention_mask=attention_mask)
+    outputs = self.gpt(input_ids=input_ids, attention_mask=attention_mask)['last_token']
   
     # 마지막 토큰의 hidden state 가져오기
     # outputs.last_hidden_state: [batch_size, seq_len, hidden_size]
-    last_token_indices = attention_mask.sum(dim=1) - 1  # 마지막 실제 토큰 인덱스
-    last_hidden_states = outputs['last_hidden_state'][range(input_ids.size(0)), last_token_indices]
+    # dropout으로 수정
+    last_hidden_states = self.droupout(outputs)
     logits = self.classifier(last_hidden_states)  # [batch_size, num_labels]
     return logits
 
