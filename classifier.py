@@ -254,13 +254,7 @@ def save_model(model, optimizer, args, config, filepath):
 
 
 def train(args):
-  #device = torch.device('cuda') if args.use_gpu else torch.device('cpu')
-  if args.use_gpu and torch.backends.mps.is_available():
-      device = torch.device("mps")
-      print("Using MPS (Apple GPU)")
-  else:
-      device = torch.device("cpu")
-      print("Using CPU")
+  device = torch.device('cuda') if args.use_gpu else torch.device('cpu')
 
   # 데이터와 해당 데이터셋 및 데이터로더를 만든다.
   train_data, num_labels = load_data(args.train, 'train')
@@ -326,13 +320,7 @@ def train(args):
 
 def test(args):
   with torch.no_grad():
-    #device = torch.device('cuda') if args.use_gpu else torch.device('cpu')
-    if args.use_gpu and torch.backends.mps.is_available():
-        device = torch.device("mps")
-        print("Using MPS (Apple GPU)")
-    else:
-        device = torch.device("cpu")
-        print("Using CPU")
+    device = torch.device('cuda') if args.use_gpu else torch.device('cpu')
     saved = torch.load(args.filepath)
     config = saved['model_config']
     model = GPT2SentimentClassifier(config)
