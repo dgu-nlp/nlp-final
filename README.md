@@ -2,8 +2,9 @@
 
 ## 환경구축
 ```
-# 추가라이브러리 설치(knn 검색용)
-pip install faiss-cpu
+# 추가라이브러리(knn 검색용)
+# env.yml에 추가되어 있음.
+faiss-gpu
 
 ```
 ## 실행
@@ -11,11 +12,9 @@ pip install faiss-cpu
 #!/bin/bash
 
 # 데이터스토어 구축
-echo "데이터스토어 구축 중..."
 python scripts/build_datastore.py --task all --use_gpu
 
 # 패러프레이즈 탐지 (기본 데이터스토어 사용)
-echo -e "\n패러프레이즈 탐지 실행 (기본 데이터스토어)..."
 python scripts/run_knn_augmented.py \
     --task paraphrase \
     --use_gpu \
@@ -26,7 +25,6 @@ python scripts/run_knn_augmented.py \
     --use_adaptive_interpolation
 
 # 패러프레이즈 탐지 (WikiText 데이터스토어 사용)
-echo -e "\n패러프레이즈 탐지 실행 (WikiText 데이터스토어)..."
 python scripts/run_knn_augmented.py \
     --task paraphrase \
     --use_gpu \
@@ -39,7 +37,6 @@ python scripts/run_knn_augmented.py \
     --wikitext_version 2
 
 # 소넷 생성 (기본 데이터스토어 사용)
-echo -e "\n소넷 생성 실행 (기본 데이터스토어)..."
 python scripts/run_knn_augmented.py \
     --task sonnet \
     --use_gpu \
@@ -54,7 +51,6 @@ python scripts/run_knn_augmented.py \
     --do_sample
 
 # 소넷 생성 (WikiText 데이터스토어 사용)
-echo -e "\n소넷 생성 실행 (WikiText 데이터스토어)..."
 python scripts/run_knn_augmented.py \
     --task sonnet \
     --use_gpu \
@@ -71,7 +67,6 @@ python scripts/run_knn_augmented.py \
     --do_sample
 
 # 실험용 추가 실행 (다른 k 값으로)
-echo -e "\n패러프레이즈 탐지 실행 (k=16)..."
 python scripts/run_knn_augmented.py \
     --task paraphrase \
     --use_gpu \
@@ -81,7 +76,6 @@ python scripts/run_knn_augmented.py \
     --use_quality_filter \
     --use_adaptive_interpolation
 
-echo -e "\n소넷 생성 실행 (k=16)..."
 python scripts/run_knn_augmented.py \
     --task sonnet \
     --use_gpu \

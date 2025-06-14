@@ -40,11 +40,14 @@ class KNNRetriever:
         
         # FAISS 인덱스 초기화
         self.faiss_index = None
+        self.gpu_resources = None
+        self.using_gpu = False
+        
         if use_faiss and datastore.is_built:
             self._build_faiss_index()
             
     def _build_faiss_index(self):
-        """FAISS 인덱스 구축"""
+        """FAISS 인덱스 구축 (GPU 우선, CPU fallback)"""
         if not self.datastore.is_built:
             raise ValueError("데이터스토어가 구축되지 않았습니다.")
             
@@ -53,15 +56,40 @@ class KNNRetriever:
         # 키들을 numpy 배열로 변환
         keys_np = self.datastore.keys.numpy().astype('float32')
         
-        # FAISS 인덱스 생성
+        # CPU 인덱스 생성
         if self.faiss_index_type == 'l2':
-            self.faiss_index = faiss.IndexFlatL2(self.datastore.hidden_size)
+            cpu_index = faiss.IndexFlatL2(self.datastore.hidden_size)
         elif self.faiss_index_type == 'inner_product':
-            self.faiss_index = faiss.IndexFlatIP(self.datastore.hidden_size)
+            cpu_index = faiss.IndexFlatIP(self.datastore.hidden_size)
             # inner product의 경우 정규화 필요
             faiss.normalize_L2(keys_np)
         else:
             raise ValueError(f"지원되지 않는 FAISS 인덱스 유형: {self.faiss_index_type}")
+            
+        # GPU 사용 시도 (GPU가 있으면 자동으로 사용)
+        if torch.cuda.is_available():
+            try:
+                # GPU 리소스 설정
+                self.gpu_resources = faiss.StandardGpuResources()
+                
+                # GPU 인덱스 생성
+                self.faiss_index = faiss.index_cpu_to_gpu(
+                    self.gpu_resources, 
+                    0,  # GPU 0 사용
+                    cpu_index
+                )
+                self.using_gpu = True
+                logger.info("GPU 인덱스 생성 완료 (GPU 0)")
+                
+            except Exception as e:
+                logger.warning(f"GPU 인덱스 생성 실패, CPU로 fallback: {e}")
+                self.faiss_index = cpu_index
+                self.using_gpu = False
+        else:
+            # GPU가 없으면 CPU 인덱스 사용
+            self.faiss_index = cpu_index
+            self.using_gpu = False
+            logger.info("CPU 인덱스 생성 완료 (GPU 사용 불가)")
             
         # 인덱스에 키 추가
         self.faiss_index.add(keys_np)
@@ -227,5 +255,32 @@ class KNNRetriever:
         if temperature is not None:
             self.temperature = temperature
             
+    def cleanup_gpu_resources(self):
+        """GPU 리소스 정리"""
+        if self.gpu_resources is not None:
+            del self.gpu_resources
+            self.gpu_resources = None
+            self.using_gpu = False
+            logger.info("GPU 리소스가 정리되었습니다.")
+            
+    def get_device_info(self) -> Dict:
+        """현재 사용 중인 디바이스 정보 반환"""
+        info = {
+            "using_gpu": self.using_gpu,
+            "cuda_available": torch.cuda.is_available(),
+            "faiss_available": self.use_faiss and self.faiss_index is not None
+        }
+        
+        if torch.cuda.is_available():
+            info["gpu_count"] = torch.cuda.device_count()
+            info["current_gpu"] = torch.cuda.current_device()
+            
+        return info
+            
     def __repr__(self):
-        return f"KNNRetriever(k={self.k}, temperature={self.temperature}, use_faiss={self.use_faiss})" 
+        device_info = "GPU" if self.using_gpu else "CPU"
+        return f"KNNRetriever(k={self.k}, temperature={self.temperature}, use_faiss={self.use_faiss}, device={device_info})"
+        
+    def __del__(self):
+        """소멸자에서 GPU 리소스 정리"""
+        self.cleanup_gpu_resources() 
