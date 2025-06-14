@@ -67,8 +67,10 @@ class SonnetGPT(nn.Module):
 
     outputs = self.gpt(input_ids=input_ids, attention_mask=attention_mask)
     
-    logits = outputs.logits
-    raise NotImplementedError
+    last_hidden_state = outputs['last_hidden_state']  # [batch_size, seq_len, hidden_size]
+    logits = self.gpt.hidden_state_to_token(last_hidden_state)  # [batch_size, seq_len, vocab_size]
+    
+    return logits
 
 
   def get_device(self):
