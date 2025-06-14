@@ -61,7 +61,16 @@ class SonnetGPT(nn.Module):
     이를 통해, 마지막 토큰에 대한 다음 토큰의 분포만 학습하는 것이 아니라, 모델은 소네트를 구성하는 자연어 분포를 학습할 수 있다.
     """
     ### 완성시켜야 할 빈 코드 블록
-    raise NotImplementedError
+    device = input_ids.device
+    input_ids = input_ids.to(device)
+    attention_mask = attention_mask.to(device)
+
+    outputs = self.gpt(input_ids=input_ids, attention_mask=attention_mask)
+    
+    last_hidden_state = outputs['last_hidden_state']  # [batch_size, seq_len, hidden_size]
+    logits = self.gpt.hidden_state_to_token(last_hidden_state)  # [batch_size, seq_len, vocab_size]
+    
+    return logits
 
 
   def get_device(self):
