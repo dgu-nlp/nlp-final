@@ -12,6 +12,7 @@ import sys
 import torch
 from torch.utils.data import DataLoader
 import logging
+import pickle
 
 # 프로젝트 루트 디렉토리를 Python path에 추가
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -74,6 +75,12 @@ def build_classifier_datastore(args):
     )
     
     logger.info(f"감성 분류용 데이터스토어 구축 완료: {save_path}")
+    
+    # 메모리 해제
+    del model, datastore, train_dataset, train_dataloader
+    if device.type == 'cuda':
+        torch.cuda.empty_cache()
+    
     return save_path
 
 
@@ -98,9 +105,16 @@ def build_paraphrase_datastore(args):
     # 모델 로드
     model_path = f'{args.epochs}-{args.lr}-paraphrase.pt'
     if os.path.exists(model_path):
-        saved = torch.load(model_path, map_location='cpu')
-        model = ParaphraseGPT(saved['args'])
-        model.load_state_dict(saved['model'])
+        try:
+            saved = torch.load(model_path, map_location='cpu')
+            model = ParaphraseGPT(saved['args'])
+            model.load_state_dict(saved['model'])
+        except Exception as e:
+            logger.warning(f"기존 방식으로 모델 로드 실패: {e}")
+            # 대안적인 로드 방식 시도
+            saved = torch.load(model_path, map_location='cpu', pickle_module=pickle)
+            model = ParaphraseGPT(saved['args'])
+            model.load_state_dict(saved['model'])
         model = model.to(device)
     else:
         raise FileNotFoundError(f"모델 파일 오류: {model_path}")
@@ -116,6 +130,12 @@ def build_paraphrase_datastore(args):
     )
     
     logger.info(f"패러프레이즈 탐지용 데이터스토어 구축 완료: {save_path}")
+    
+    # 메모리 해제
+    del model, datastore, train_dataset, train_dataloader, saved
+    if device.type == 'cuda':
+        torch.cuda.empty_cache()
+    
     return save_path
 
 
@@ -139,9 +159,16 @@ def build_sonnet_datastore(args):
     # 모델 로드
     model_path = f'{args.epochs-1}_{args.epochs}-{args.lr}-sonnet.pt'
     if os.path.exists(model_path):
-        saved = torch.load(model_path, map_location='cpu', weights_only=False)
-        model = SonnetGPT(saved['args'])
-        model.load_state_dict(saved['model'])
+        try:
+            saved = torch.load(model_path, map_location='cpu')
+            model = SonnetGPT(saved['args'])
+            model.load_state_dict(saved['model'])
+        except Exception as e:
+            logger.warning(f"기존 방식으로 모델 로드 실패: {e}")
+            # 대안적인 로드 방식 시도
+            saved = torch.load(model_path, map_location='cpu', pickle_module=pickle, weights_only=False)
+            model = SonnetGPT(saved['args'])
+            model.load_state_dict(saved['model'])
         model = model.to(device)
     else:
         raise FileNotFoundError(f"모델 파일 오류: {model_path}")
@@ -157,6 +184,12 @@ def build_sonnet_datastore(args):
     )
     
     logger.info(f"소넷 생성용 데이터스토어 구축 완료: {save_path}")
+    
+    # 메모리 해제
+    del model, datastore, sonnet_dataset, sonnet_dataloader, saved
+    if device.type == 'cuda':
+        torch.cuda.empty_cache()
+    
     return save_path
 
 
@@ -164,7 +197,26 @@ def build_wikitext_datastore(args):
     """WikiText 데이터스토어 구축"""
     
     from scripts.prepare_wikitext import prepare_wikitext_datastore
-    return prepare_wikitext_datastore(args)
+    
+    # Namespace 객체 생성하여 필요한 파라미터 전달
+    wikitext_args = SimpleNamespace(
+        version=args.version,
+        data_dir=args.data_dir,
+        max_length=args.max_length,
+        batch_size=args.batch_size,
+        use_gpu=args.use_gpu
+    )
+    
+    datastore_path = prepare_wikitext_datastore(wikitext_args)
+    
+    # 메모리 해제 (prepare_wikitext_datastore 내부에서 사용된 리소스는 해제할 수 없지만,
+    # 시스템 메모리 정리를 위해 가비지 컬렉션 강제 실행)
+    import gc
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+    
+    return datastore_path
 
 
 def main():
@@ -175,6 +227,8 @@ def main():
                         choices=['classifier', 'paraphrase', 'sonnet', 'wikitext', 'all'])
     parser.add_argument("--use_gpu", action='store_true')
     parser.add_argument("--batch_size", type=int, default=8)
+    parser.add_argument("--data_dir", type=str, default='datastores',
+                        help="데이터 파일이 저장된 디렉토리")
     
     # 분류기 관련 인수
     parser.add_argument("--dataset", type=str, default='sst',

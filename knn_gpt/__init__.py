@@ -9,7 +9,6 @@ from .datastore import DataStore
 from .retriever import KNNRetriever
 from .interpolation import InterpolationModule
 from .quality_filter import QualityFilter
-from .speculative_decoder import SpeculativeDecoder
 
 __version__ = "1.0.0"
 __author__ = "NLP Final Project Team"
@@ -18,6 +17,5 @@ __all__ = [
     "DataStore",
     "KNNRetriever", 
     "InterpolationModule",
-    "QualityFilter",
-    "SpeculativeDecoder"
+    "QualityFilter"
 ] 
