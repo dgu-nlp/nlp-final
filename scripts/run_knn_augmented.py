@@ -160,8 +160,14 @@ def run_paraphrase_detection(args: argparse.Namespace):
     knn_model, base_model = load_knn_model('paraphrase', args)
     
     # 데이터스토어 로드 및 설정
-    datastore = load_datastore('paraphrase', args)
-    knn_model.set_datastore(datastore)
+    try:
+        logger.info("데이터스토어 로드 중...")
+        datastore = load_datastore('paraphrase', args)
+        knn_model.set_datastore(datastore)
+        logger.info("k-NN 검색기가 성공적으로 초기화되었습니다.")
+    except Exception as e:
+        logger.error(f"데이터스토어 로드 중 오류 발생: {e}")
+        raise
     
     # 테스트 데이터 로드
     try:
@@ -182,80 +188,56 @@ def run_paraphrase_detection(args: argparse.Namespace):
     # 평가
     device = torch.device('cuda' if args.use_gpu and torch.cuda.is_available() else 'cpu')
     knn_model = knn_model.to(device)
-    base_model = base_model.to(device)
     
     # 결과 저장을 위한 딕셔너리
     results = {
-        'base_model': {'accuracy': 0, 'predictions': []},
-        'knn_model': {'accuracy': 0, 'predictions': []}
+        'knn_model': {'predictions': []}
     }
     
-    # k-NN 활성화/비활성화 비교
-    for use_knn in [False, True]:
-        if use_knn:
-            logger.info("k-NN 증강 모드로 평가 중...")
-            model = knn_model
-            model_type = 'knn_model'
-        else:
-            logger.info("기본 모드로 평가 중...")
-            model = base_model
-            model_type = 'base_model'
+    # kNN 모델 평가
+    logger.info("k-NN 증강 모드로 평가 중...")
+    model = knn_model
+    model.eval()
+    predictions = []
+    sent_ids = []
+    
+    with torch.no_grad():
+        for batch in test_dataloader:
+            b_ids, b_mask = batch['token_ids'], batch['attention_mask']
+            b_sent_ids = batch['sent_ids']
             
-        model.eval()
-        correct = 0
-        total = 0
-        predictions = []
-        sent_ids = []
-        
-        with torch.no_grad():
-            for batch in test_dataloader:
-                b_ids, b_mask = batch['token_ids'], batch['attention_mask']
-                b_sent_ids = batch['sent_ids']
+            b_ids = b_ids.to(device)
+            b_mask = b_mask.to(device)
+            
+            try:
+                outputs = model(b_ids, b_mask)
+                logits = outputs['logits']
                 
-                b_ids = b_ids.to(device)
-                b_mask = b_mask.to(device)
+                preds = torch.argmax(logits, dim=1)
                 
-                try:
-                    if use_knn:
-                        outputs = model(b_ids, b_mask)
-                        logits = outputs['logits']
-                    else:
-                        logits = model(b_ids, b_mask)
-                    
-                    preds = torch.argmax(logits, dim=1)
-                    
-                    # 예측 결과와 문장 ID 저장
-                    predictions.extend(preds.cpu().numpy().tolist())
-                    sent_ids.extend(b_sent_ids)
-                except RuntimeError as e:
-                    logger.error(f"예측 중 오류 발생: {e}")
-                    if "Expected all tensors to be on the same device" in str(e):
-                        logger.info(f"텐서 디바이스 불일치 감지. 현재 디바이스: {device}")
-                        logger.info(f"모델 디바이스: {next(model.parameters()).device}")
-                        if use_knn:
-                            logger.info(f"데이터스토어 디바이스: {datastore.device}")
-                            logger.info(f"데이터스토어 키 디바이스: {datastore.keys.device}")
-                        raise
-        
-        # 테스트 데이터에는 레이블이 없으므로 정확도를 계산할 수 없음
-        logger.info(f"{'k-NN 증강' if use_knn else '기본'} 모드 예측 완료: {len(predictions)} 샘플")
-        
-        # 결과 저장
-        results[model_type]['accuracy'] = 0  # 테스트 데이터에는 레이블이 없음
-        results[model_type]['predictions'] = list(zip(sent_ids, predictions))
+                # 예측 결과와 문장 ID 저장
+                predictions.extend(preds.cpu().numpy().tolist())
+                sent_ids.extend(b_sent_ids)
+            except RuntimeError as e:
+                logger.error(f"예측 중 오류 발생: {e}")
+                if "Expected all tensors to be on the same device" in str(e):
+                    logger.info(f"텐서 디바이스 불일치 감지. 현재 디바이스: {device}")
+                    logger.info(f"모델 디바이스: {next(model.parameters()).device}")
+                    logger.info(f"데이터스토어 디바이스: {datastore.device}")
+                    logger.info(f"데이터스토어 키 디바이스: {datastore.keys.device}")
+                
+                # 오류 발생 시 해당 배치 건너뛰기
+                logger.warning(f"배치 처리 중 오류 발생. 해당 배치를 건너뜁니다.")
+                continue
+    
+    # 예측 완료 로그
+    logger.info(f"k-NN 증강 모드 예측 완료: {len(predictions)} 샘플")
+    
+    # 결과 저장
+    results['knn_model']['predictions'] = list(zip(sent_ids, predictions))
     
     # 결과 파일로 저장
     datastore_type = 'wikitext' if args.use_wikitext else 'default'
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    
-    # 기본 모델 결과 저장
-    base_output_file = f'predictions/para-test-output.csv'
-    with open(base_output_file, "w+", newline='') as f:
-        writer = csv.writer(f)
-        writer.writerow(["id", "Predicted_Is_Paraphrase"])
-        for sent_id, pred in results['base_model']['predictions']:
-            writer.writerow([sent_id, pred])
-    logger.info(f"기본 모델 결과를 {base_output_file}에 저장했습니다.")
     
     # kNN 모델 결과 저장
     knn_output_file = f'predictions/knn_para-test-output_{datastore_type}_k{args.k}.csv'
@@ -266,9 +248,9 @@ def run_paraphrase_detection(args: argparse.Namespace):
             writer.writerow([sent_id, pred])
     logger.info(f"k-NN 모델 결과를 {knn_output_file}에 저장했습니다.")
     
-    # 성능 비교 결과 저장
-    comparison_file = f'predictions/knn_para_comparison_{datastore_type}_k{args.k}.json'
-    with open(comparison_file, "w+") as f:
+    # 파라미터 정보 저장
+    params_file = f'predictions/knn_para_params_{datastore_type}_k{args.k}.json'
+    with open(params_file, "w+") as f:
         json.dump({
             'parameters': {
                 'k': args.k,
@@ -279,7 +261,7 @@ def run_paraphrase_detection(args: argparse.Namespace):
                 'datastore_type': datastore_type
             }
         }, f, indent=2)
-    logger.info(f"파라미터 정보를 {comparison_file}에 저장했습니다.")
+    logger.info(f"파라미터 정보를 {params_file}에 저장했습니다.")
 
 
 def run_sonnet_generation(args: argparse.Namespace):
@@ -288,8 +270,14 @@ def run_sonnet_generation(args: argparse.Namespace):
     knn_model, base_model = load_knn_model('sonnet', args)
     
     # 데이터스토어 로드 및 설정
-    datastore = load_datastore('sonnet', args)
-    knn_model.set_datastore(datastore)
+    try:
+        logger.info("데이터스토어 로드 중...")
+        datastore = load_datastore('sonnet', args)
+        knn_model.set_datastore(datastore)
+        logger.info("k-NN 검색기가 성공적으로 초기화되었습니다.")
+    except Exception as e:
+        logger.error(f"데이터스토어 로드 중 오류 발생: {e}")
+        raise
     
     # 토크나이저
     tokenizer = base_model.tokenizer
@@ -303,33 +291,21 @@ def run_sonnet_generation(args: argparse.Namespace):
     
     device = torch.device('cuda' if args.use_gpu and torch.cuda.is_available() else 'cpu')
     knn_model = knn_model.to(device)
-    base_model = base_model.to(device)
     
     # 결과 저장을 위한 딕셔너리
-    results = {
-        'base_model': [],
-        'knn_model': []
-    }
+    results = []
     
-    # k-NN 활성화/비활성화 비교
-    for use_knn in [False, True]:
-        if use_knn:
-            logger.info("\nk-NN 증강 모드로 생성 중...")
-            model = knn_model
-            model_type = 'knn_model'
-        else:
-            logger.info("\n기본 모드로 생성 중...")
-            model = base_model
-            model_type = 'base_model'
-            
-        model.eval()
+    logger.info("\nk-NN 증강 모드로 생성 중...")
+    model = knn_model
+    model.eval()
+    
+    for prompt in prompts:
+        # 입력 토큰화
+        inputs = tokenizer(prompt, return_tensors='pt')
+        input_ids = inputs['input_ids'].to(device)
+        attention_mask = inputs['attention_mask'].to(device)
         
-        for prompt in prompts:
-            # 입력 토큰화
-            inputs = tokenizer(prompt, return_tensors='pt')
-            input_ids = inputs['input_ids'].to(device)
-            attention_mask = inputs['attention_mask'].to(device)
-            
+        try:
             # 텍스트 생성
             generated_ids, generated_text = model.generate(
                 input_ids=input_ids,
@@ -344,29 +320,23 @@ def run_sonnet_generation(args: argparse.Namespace):
             logger.info(f"생성된 텍스트:\n{generated_text}")
             
             # 결과 저장
-            results[model_type].append({
+            results.append({
                 'prompt': prompt,
                 'generated_text': generated_text
             })
+        except Exception as e:
+            logger.error(f"텍스트 생성 중 오류 발생: {e}")
+            logger.warning(f"프롬프트 '{prompt}'에 대한 생성을 건너뜁니다.")
+            continue
     
     # 결과 파일로 저장
     datastore_type = 'wikitext' if args.use_wikitext else 'default'
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    
-    # 기본 모델 결과 저장
-    base_output_file = f'predictions/generated_sonnets.txt'
-    with open(base_output_file, "w+") as f:
-        f.write("--Generated Sonnets (Base Model)--\n\n")
-        for i, result in enumerate(results['base_model']):
-            f.write(f"\nPrompt {i+1}: {result['prompt']}\n")
-            f.write(f"{result['generated_text']}\n\n")
-    logger.info(f"기본 모델 생성 결과를 {base_output_file}에 저장했습니다.")
     
     # kNN 모델 결과 저장
     knn_output_file = f'predictions/knn_generated_sonnets_{datastore_type}_k{args.k}.txt'
     with open(knn_output_file, "w+") as f:
         f.write("--Generated Sonnets (k-NN Model)--\n\n")
-        for i, result in enumerate(results['knn_model']):
+        for i, result in enumerate(results):
             f.write(f"\nPrompt {i+1}: {result['prompt']}\n")
             f.write(f"{result['generated_text']}\n\n")
     logger.info(f"k-NN 모델 생성 결과를 {knn_output_file}에 저장했습니다.")

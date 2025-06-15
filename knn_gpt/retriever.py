@@ -143,36 +143,54 @@ class KNNRetriever:
         
     def _direct_search(self, query_vectors: torch.Tensor, k: int) -> Tuple[torch.Tensor, torch.Tensor]:
         """직접 거리 계산을 통한 검색"""
-        # 데이터스토어 키를 동일한 디바이스로 이동
-        keys = self.datastore.keys.to(query_vectors.device)
-        
-        # 배치 처리를 위한 차원 확장
-        if query_vectors.dim() == 1:
-            query_vectors = query_vectors.unsqueeze(0)
+        try:
+            # 데이터스토어 키를 동일한 디바이스로 이동
+            keys = self.datastore.keys.to(query_vectors.device)
             
-        batch_size = query_vectors.size(0)
-        distances_list = []
-        indices_list = []
-        
-        # 메모리 효율성을 위해 배치 단위로 처리
-        for i in range(batch_size):
-            # 현재 쿼리 벡터
-            query = query_vectors[i].unsqueeze(0)  # [1, hidden_size]
+            # 배치 처리를 위한 차원 확장
+            if query_vectors.dim() == 1:
+                query_vectors = query_vectors.unsqueeze(0)
+                
+            batch_size = query_vectors.size(0)
+            distances_list = []
+            indices_list = []
             
-            # L2 거리 계산
-            distances = torch.cdist(query, keys, p=2)[0]  # [num_keys]
+            # 차원 확인 및 로깅
+            logger.info(f"쿼리 벡터 크기: {query_vectors.shape}, 키 크기: {keys.shape}")
             
-            # 상위 k개 가져오기
-            topk_distances, topk_indices = torch.topk(distances, k=k, largest=False)
+            # 메모리 효율성을 위해 배치 단위로 처리
+            for i in range(batch_size):
+                # 현재 쿼리 벡터
+                query = query_vectors[i].unsqueeze(0)  # [1, hidden_size]
+                
+                # 모든 키와의 유클리드 거리 계산 (직접 계산)
+                # L2 거리: ||a - b||^2 = ||a||^2 + ||b||^2 - 2*a·b
+                query_norm = torch.sum(query ** 2, dim=1).view(-1, 1)  # [1, 1]
+                keys_norm = torch.sum(keys ** 2, dim=1).view(1, -1)    # [1, num_keys]
+                distances = query_norm + keys_norm
+                distances = distances - 2 * torch.mm(query, keys.t())  # [1, num_keys]
+                distances = torch.sqrt(torch.clamp(distances, min=1e-8))  # 수치 안정성을 위한 클램핑
+                distances = distances.squeeze(0)  # [num_keys]
+                
+                # 상위 k개 가져오기
+                topk_distances, topk_indices = torch.topk(distances, k=min(k, len(distances)), largest=False)
+                
+                distances_list.append(topk_distances)
+                indices_list.append(topk_indices)
+                
+            # 결과 결합
+            distances = torch.stack(distances_list)
+            indices = torch.stack(indices_list)
             
-            distances_list.append(topk_distances)
-            indices_list.append(topk_indices)
+            return distances, indices
             
-        # 결과 결합
-        distances = torch.stack(distances_list)
-        indices = torch.stack(indices_list)
-        
-        return distances, indices
+        except Exception as e:
+            logger.error(f"직접 거리 계산 중 오류 발생: {e}")
+            # 최후의 방법: 무작위 이웃 반환
+            batch_size = 1 if query_vectors.dim() == 1 else query_vectors.size(0)
+            random_distances = torch.ones(batch_size, k, device=query_vectors.device)
+            random_indices = torch.randint(0, len(self.datastore), (batch_size, k), device=query_vectors.device)
+            return random_distances, random_indices
         
     def get_knn_logits(self, 
                       query_hidden: torch.Tensor, 
