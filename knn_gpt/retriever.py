@@ -70,38 +70,65 @@ class KNNRetriever:
         # 차원 확인
         d = keys.shape[1]
         
-        # CPU 인덱스 생성 (기본)
-        cpu_index = faiss.IndexFlatL2(d)
-        
-        # GPU 사용 가능 여부 확인
-        use_gpu = self.device.type == 'cuda' and torch.cuda.is_available()
-        
-        if use_gpu:
-            try:
-                # GPU 리소스 설정
-                res = faiss.StandardGpuResources()
-                
-                # GPU 인덱스로 변환
-                self.faiss_index = faiss.index_cpu_to_gpu(res, 0, cpu_index)  # GPU 0 사용
-                self.gpu_resources = res
-                self.using_gpu = True
-                logger.info("GPU 인덱스 생성 완료 (GPU 0)")
-            except Exception as e:
-                logger.warning(f"GPU 인덱스 생성 실패: {e}. CPU 인덱스로 대체합니다.")
+        try:
+            # CPU 인덱스 생성 (기본)
+            cpu_index = faiss.IndexFlatL2(d)
+            
+            # GPU 사용 가능 여부 확인
+            use_gpu = self.device.type == 'cuda' and torch.cuda.is_available()
+            
+            if use_gpu:
+                try:
+                    # GPU 리소스 설정
+                    res = faiss.StandardGpuResources()
+                    
+                    # GPU 인덱스 구성 옵션
+                    config = faiss.GpuIndexFlatConfig()
+                    config.device = torch.cuda.current_device()  # 현재 CUDA 디바이스 사용
+                    
+                    # GPU 인덱스로 변환
+                    self.faiss_index = faiss.GpuIndexFlatL2(res, d, config)
+                    self.gpu_resources = res
+                    self.using_gpu = True
+                    logger.info(f"GPU 인덱스 생성 완료 (GPU {config.device})")
+                except Exception as e:
+                    logger.warning(f"GPU 인덱스 생성 실패: {e}. CPU 인덱스로 대체합니다.")
+                    self.faiss_index = cpu_index
+                    self.gpu_resources = None
+                    self.using_gpu = False
+            else:
+                # CPU 인덱스 사용
                 self.faiss_index = cpu_index
                 self.gpu_resources = None
                 self.using_gpu = False
-        else:
-            # CPU 인덱스 사용
-            self.faiss_index = cpu_index
+                logger.info("CPU 인덱스 생성 완료")
+            
+            # 인덱스에 키 추가
+            keys_np = keys.cpu().numpy().astype('float32')
+            
+            # 메모리 효율성을 위해 배치로 추가
+            batch_size = 10000  # 배치 크기 설정
+            num_batches = (len(keys_np) + batch_size - 1) // batch_size  # 올림 나눗셈
+            
+            for i in range(num_batches):
+                start_idx = i * batch_size
+                end_idx = min((i + 1) * batch_size, len(keys_np))
+                batch = keys_np[start_idx:end_idx]
+                self.faiss_index.add(batch)
+                
+            logger.info(f"FAISS 인덱스 구축 완료. 총 {len(keys)}개 벡터")
+            
+            # 인덱스 검증
+            test_query = keys_np[:1]  # 첫 번째 키로 테스트
+            distances, indices = self.faiss_index.search(test_query, 1)
+            logger.info(f"FAISS 인덱스 검증: 테스트 쿼리에 대한 가장 가까운 인덱스 = {indices[0][0]}")
+            
+        except Exception as e:
+            logger.error(f"FAISS 인덱스 구축 중 오류 발생: {e}")
+            self.faiss_index = None
             self.gpu_resources = None
             self.using_gpu = False
-            logger.info("CPU 인덱스 생성 완료")
-        
-        # 인덱스에 키 추가
-        keys_np = keys.cpu().numpy().astype('float32')
-        self.faiss_index.add(keys_np)
-        logger.info(f"FAISS 인덱스 구축 완료. 총 {len(keys)}개 벡터")
+            logger.warning("FAISS 인덱스 구축에 실패했습니다. 직접 거리 계산을 사용합니다.")
         
     def search(self, query_vectors: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         """
@@ -126,11 +153,26 @@ class KNNRetriever:
             try:
                 # FAISS 검색
                 query_np = query_vectors.cpu().numpy().astype('float32')
+                
+                # 배치 처리를 위한 차원 확인
+                if query_np.ndim == 1:
+                    query_np = query_np.reshape(1, -1)  # [hidden_size] -> [1, hidden_size]
+                
+                # FAISS 검색 실행
                 distances, indices = self.faiss_index.search(query_np, k)
                 
                 # 텐서로 변환하고 디바이스로 이동
                 distances = torch.from_numpy(distances).to(self.device)
                 indices = torch.from_numpy(indices).to(self.device)
+                
+                # 결과 검증
+                if distances.shape[0] != query_vectors.shape[0] or indices.shape[0] != query_vectors.shape[0]:
+                    logger.warning(f"FAISS 검색 결과 형태 불일치: 쿼리 배치 크기 {query_vectors.shape[0]}, 결과 크기 {distances.shape[0]}")
+                    # 직접 계산으로 대체
+                    return self._direct_search(query_vectors, k)
+                
+                return distances, indices
+                
             except Exception as e:
                 logger.warning(f"FAISS 검색 실패: {e}. 직접 거리 계산으로 대체합니다.")
                 # FAISS 검색 실패 시 직접 계산으로 대체
@@ -138,8 +180,6 @@ class KNNRetriever:
         else:
             # 직접 거리 계산
             return self._direct_search(query_vectors, k)
-        
-        return distances, indices
         
     def _direct_search(self, query_vectors: torch.Tensor, k: int) -> Tuple[torch.Tensor, torch.Tensor]:
         """직접 거리 계산을 통한 검색"""
