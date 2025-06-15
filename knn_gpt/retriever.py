@@ -11,6 +11,7 @@ import numpy as np
 from typing import Tuple, Optional, Dict
 import logging
 import faiss  # 빠른 유사도 검색을 위한 라이브러리
+import time
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -72,6 +73,7 @@ class KNNRetriever:
         
         try:
             # CPU 인덱스 생성 (기본)
+            logger.info(f"차원이 {d}인 FAISS 인덱스를 생성합니다.")
             cpu_index = faiss.IndexFlatL2(d)
             
             # GPU 사용 가능 여부 확인
@@ -79,15 +81,29 @@ class KNNRetriever:
             
             if use_gpu:
                 try:
+                    # GPU 정보 출력
+                    gpu_count = torch.cuda.device_count()
+                    current_device = torch.cuda.current_device()
+                    logger.info(f"사용 가능한 GPU 수: {gpu_count}, 현재 디바이스: {current_device}")
+                    logger.info(f"현재 GPU: {torch.cuda.get_device_name(current_device)}")
+                    
                     # GPU 리소스 설정
                     res = faiss.StandardGpuResources()
                     
                     # GPU 인덱스 구성 옵션
                     config = faiss.GpuIndexFlatConfig()
-                    config.device = torch.cuda.current_device()  # 현재 CUDA 디바이스 사용
+                    config.device = current_device
+                    config.useFloat16 = False  # 정확도를 위해 float32 사용
                     
-                    # GPU 인덱스로 변환
-                    self.faiss_index = faiss.GpuIndexFlatL2(res, d, config)
+                    # GPU 인덱스 생성
+                    logger.info(f"GPU {config.device}에 FAISS 인덱스를 생성합니다.")
+                    gpu_index = faiss.GpuIndexFlatL2(res, d, config)
+                    
+                    # 인덱스 확인
+                    if not gpu_index:
+                        raise RuntimeError("GPU 인덱스 생성 실패")
+                        
+                    self.faiss_index = gpu_index
                     self.gpu_resources = res
                     self.using_gpu = True
                     logger.info(f"GPU 인덱스 생성 완료 (GPU {config.device})")
@@ -104,24 +120,45 @@ class KNNRetriever:
                 logger.info("CPU 인덱스 생성 완료")
             
             # 인덱스에 키 추가
+            logger.info("데이터를 FAISS 인덱스에 추가하는 중...")
             keys_np = keys.cpu().numpy().astype('float32')
             
             # 메모리 효율성을 위해 배치로 추가
             batch_size = 10000  # 배치 크기 설정
             num_batches = (len(keys_np) + batch_size - 1) // batch_size  # 올림 나눗셈
             
+            logger.info(f"총 {num_batches}개 배치로 {len(keys_np)}개 벡터를 추가합니다. (배치 크기: {batch_size})")
+            
+            # 시작 시간 기록
+            start_time = time.time()
+            
             for i in range(num_batches):
                 start_idx = i * batch_size
                 end_idx = min((i + 1) * batch_size, len(keys_np))
                 batch = keys_np[start_idx:end_idx]
+                
+                # 배치 추가
                 self.faiss_index.add(batch)
                 
-            logger.info(f"FAISS 인덱스 구축 완료. 총 {len(keys)}개 벡터")
+                # 진행 상황 보고 (10% 단위)
+                if (i + 1) % max(1, num_batches // 10) == 0 or i == num_batches - 1:
+                    progress = (i + 1) / num_batches * 100
+                    elapsed = time.time() - start_time
+                    logger.info(f"인덱스 구축 진행률: {progress:.1f}% ({i+1}/{num_batches} 배치, 경과 시간: {elapsed:.1f}초)")
+                
+            # 총 소요 시간
+            total_time = time.time() - start_time
+            logger.info(f"FAISS 인덱스 구축 완료. 총 {len(keys)}개 벡터, 소요 시간: {total_time:.1f}초")
             
             # 인덱스 검증
+            logger.info("인덱스 검증 중...")
             test_query = keys_np[:1]  # 첫 번째 키로 테스트
             distances, indices = self.faiss_index.search(test_query, 1)
             logger.info(f"FAISS 인덱스 검증: 테스트 쿼리에 대한 가장 가까운 인덱스 = {indices[0][0]}")
+            
+            # 인덱스 크기 확인
+            if hasattr(self.faiss_index, 'ntotal'):
+                logger.info(f"인덱스에 추가된 총 벡터 수: {self.faiss_index.ntotal}")
             
         except Exception as e:
             logger.error(f"FAISS 인덱스 구축 중 오류 발생: {e}")
