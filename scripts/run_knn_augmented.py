@@ -88,7 +88,13 @@ def load_knn_model(task: str, args: argparse.Namespace) -> KNNAugmentedGPT2:
 
 def load_datastore(task: str, args: argparse.Namespace) -> DataStore:
     """데이터스토어 로드"""
-    device = torch.device('cuda' if args.use_gpu and torch.cuda.is_available() else 'cpu')
+    # 디바이스 설정
+    if args.use_gpu and torch.cuda.is_available():
+        device = torch.device(f'cuda:0')  # 명시적으로 cuda:0 사용
+        logger.info(f"GPU 디바이스 사용: {device}")
+    else:
+        device = torch.device('cpu')
+        logger.info(f"CPU 디바이스 사용: {device}")
     
     if args.use_wikitext:
         # WikiText 데이터스토어 사용

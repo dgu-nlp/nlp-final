@@ -70,29 +70,38 @@ class KNNRetriever:
         # 차원 확인
         d = keys.shape[1]
         
+        # CPU 인덱스 생성 (기본)
+        cpu_index = faiss.IndexFlatL2(d)
+        
         # GPU 사용 가능 여부 확인
         use_gpu = self.device.type == 'cuda' and torch.cuda.is_available()
         
         if use_gpu:
-            # GPU 인덱스 생성
-            res = faiss.StandardGpuResources()
-            config = faiss.GpuIndexFlatConfig()
-            config.device = self.device.index if hasattr(self.device, 'index') else 0
-            self.faiss_index = faiss.GpuIndexFlatL2(res, d, config)
-            self.using_gpu = True
-            logger.info(f"GPU 인덱스 생성 완료 (GPU {config.device})")
+            try:
+                # GPU 리소스 설정
+                res = faiss.StandardGpuResources()
+                
+                # GPU 인덱스로 변환
+                self.faiss_index = faiss.index_cpu_to_gpu(res, 0, cpu_index)  # GPU 0 사용
+                self.gpu_resources = res
+                self.using_gpu = True
+                logger.info("GPU 인덱스 생성 완료 (GPU 0)")
+            except Exception as e:
+                logger.warning(f"GPU 인덱스 생성 실패: {e}. CPU 인덱스로 대체합니다.")
+                self.faiss_index = cpu_index
+                self.gpu_resources = None
+                self.using_gpu = False
         else:
-            # CPU 인덱스 생성
-            self.faiss_index = faiss.IndexFlatL2(d)
+            # CPU 인덱스 사용
+            self.faiss_index = cpu_index
+            self.gpu_resources = None
             self.using_gpu = False
             logger.info("CPU 인덱스 생성 완료")
         
         # 인덱스에 키 추가
-        self.faiss_index.add(keys.cpu().numpy())
+        keys_np = keys.cpu().numpy().astype('float32')
+        self.faiss_index.add(keys_np)
         logger.info(f"FAISS 인덱스 구축 완료. 총 {len(keys)}개 벡터")
-        
-        # 리소스 정리
-        self.gpu_resources = res if use_gpu else None
         
     def search(self, query_vectors: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         """
@@ -113,28 +122,55 @@ class KNNRetriever:
         # 실제 사용할 k 결정
         k = min(self.k, len(self.datastore))
         
-        if self.use_faiss:
-            # FAISS 검색
-            query_np = query_vectors.cpu().numpy().astype('float32')
-            distances, indices = self.faiss_index.search(query_np, k)
-            
-            # 텐서로 변환하고 디바이스로 이동
-            distances = torch.from_numpy(distances).to(self.device)
-            indices = torch.from_numpy(indices).to(self.device)
+        if self.use_faiss and self.faiss_index is not None:
+            try:
+                # FAISS 검색
+                query_np = query_vectors.cpu().numpy().astype('float32')
+                distances, indices = self.faiss_index.search(query_np, k)
+                
+                # 텐서로 변환하고 디바이스로 이동
+                distances = torch.from_numpy(distances).to(self.device)
+                indices = torch.from_numpy(indices).to(self.device)
+            except Exception as e:
+                logger.warning(f"FAISS 검색 실패: {e}. 직접 거리 계산으로 대체합니다.")
+                # FAISS 검색 실패 시 직접 계산으로 대체
+                return self._direct_search(query_vectors, k)
         else:
             # 직접 거리 계산
-            keys = self.datastore.keys.to(self.device)
+            return self._direct_search(query_vectors, k)
+        
+        return distances, indices
+        
+    def _direct_search(self, query_vectors: torch.Tensor, k: int) -> Tuple[torch.Tensor, torch.Tensor]:
+        """직접 거리 계산을 통한 검색"""
+        # 데이터스토어 키를 동일한 디바이스로 이동
+        keys = self.datastore.keys.to(query_vectors.device)
+        
+        # 배치 처리를 위한 차원 확장
+        if query_vectors.dim() == 1:
+            query_vectors = query_vectors.unsqueeze(0)
+            
+        batch_size = query_vectors.size(0)
+        distances_list = []
+        indices_list = []
+        
+        # 메모리 효율성을 위해 배치 단위로 처리
+        for i in range(batch_size):
+            # 현재 쿼리 벡터
+            query = query_vectors[i].unsqueeze(0)  # [1, hidden_size]
             
             # L2 거리 계산
-            # [batch_size, 1, hidden_size] - [1, num_keys, hidden_size] = [batch_size, num_keys, hidden_size]
-            query_expanded = query_vectors.unsqueeze(1)
-            keys_expanded = keys.unsqueeze(0)
-            
-            # L2 거리 계산
-            distances = torch.norm(query_expanded - keys_expanded, dim=2, p=2)
+            distances = torch.cdist(query, keys, p=2)[0]  # [num_keys]
             
             # 상위 k개 가져오기
-            distances, indices = torch.topk(distances, k=k, dim=1, largest=False)
+            topk_distances, topk_indices = torch.topk(distances, k=k, largest=False)
+            
+            distances_list.append(topk_distances)
+            indices_list.append(topk_indices)
+            
+        # 결과 결합
+        distances = torch.stack(distances_list)
+        indices = torch.stack(indices_list)
         
         return distances, indices
         
