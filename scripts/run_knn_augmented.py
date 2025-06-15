@@ -140,9 +140,9 @@ def load_datastore(task: str, args: argparse.Namespace) -> DataStore:
                 
                 # 청크 로드
                 for i in range(max_chunks):
-                    chunk_path = f"{base_path}_chunk{i+1}.pt"
+                    chunk_path = f"{base_path}_chunk{i}.pt"
                     if os.path.exists(chunk_path):
-                        logger.info(f"청크 {i+2}/{max_chunks} 로드 중: {chunk_path}")
+                        logger.info(f"청크 {i+1}/{max_chunks} 로드 중: {chunk_path}")
                         chunk_data = torch.load(chunk_path, map_location=device)
                         
                         # 청크 데이터 추가

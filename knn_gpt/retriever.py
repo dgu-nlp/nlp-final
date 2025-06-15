@@ -72,92 +72,79 @@ class KNNRetriever:
         d = keys.shape[1]
         
         try:
-            # CPU 인덱스 생성 (기본)
-            logger.info(f"차원이 {d}인 FAISS 인덱스를 생성합니다.")
+            # NumPy 배열로 변환 (학습 및 인덱스 구축에 사용)
+            keys_np = keys.cpu().numpy().astype('float32')
             
             # 데이터 크기에 따라 적절한 인덱스 선택
             data_size = len(keys)
-            
-            if data_size > 1000000:
-                # 대용량 데이터에는 IVF 인덱스 사용
-                nlist = min(4096, data_size // 100)  # 클러스터 수
-                logger.info(f"대용량 데이터 감지: IVF 인덱스 사용 (nlist={nlist})")
-                quantizer = faiss.IndexFlatL2(d)
-                cpu_index = faiss.IndexIVFFlat(quantizer, d, nlist, faiss.METRIC_L2)
-                cpu_index.nprobe = min(256, nlist // 4)  # 검색 시 탐색할 클러스터 수
-            else:
-                # 소규모 데이터에는 Flat 인덱스 사용
-                logger.info("소규모 데이터: Flat 인덱스 사용")
-                cpu_index = faiss.IndexFlatL2(d)
             
             # GPU 사용 가능 여부 확인
             use_gpu = self.device.type == 'cuda' and torch.cuda.is_available()
             
             if use_gpu:
-                try:
-                    # GPU 정보 출력
-                    gpu_count = torch.cuda.device_count()
-                    current_device = torch.cuda.current_device()
-                    logger.info(f"사용 가능한 GPU 수: {gpu_count}, 현재 디바이스: {current_device}")
-                    logger.info(f"현재 GPU: {torch.cuda.get_device_name(current_device)}")
-                    
-                    # GPU 리소스 설정
-                    res = faiss.StandardGpuResources()
-                    
-                    # GPU 인덱스 구성 옵션
-                    config = faiss.GpuIndexFlatConfig()
-                    config.device = current_device
-                    config.useFloat16 = False  # 정확도를 위해 float32 사용
-                    
-                    # GPU 인덱스 생성
-                    logger.info(f"GPU {config.device}에 FAISS 인덱스를 생성합니다.")
-                    
-                    if isinstance(cpu_index, faiss.IndexIVFFlat):
-                        # IVF 인덱스를 GPU로 이동
-                        gpu_index = faiss.index_cpu_to_gpu(res, current_device, cpu_index)
-                    else:
-                        # Flat 인덱스를 GPU로 이동
-                        gpu_index = faiss.GpuIndexFlatL2(res, d, config)
-                    
-                    # 인덱스 확인
-                    if not gpu_index:
-                        raise RuntimeError("GPU 인덱스 생성 실패")
-                        
-                    self.faiss_index = gpu_index
-                    self.gpu_resources = res
-                    self.using_gpu = True
-                    logger.info(f"GPU 인덱스 생성 완료 (GPU {config.device})")
-                except Exception as e:
-                    logger.warning(f"GPU 인덱스 생성 실패: {e}. CPU 인덱스로 대체합니다.")
-                    self.faiss_index = cpu_index
-                    self.gpu_resources = None
-                    self.using_gpu = False
-            else:
-                # CPU 인덱스 사용
-                self.faiss_index = cpu_index
-                self.gpu_resources = None
-                self.using_gpu = False
-                logger.info("CPU 인덱스 생성 완료")
+                # GPU 정보 출력
+                gpu_count = torch.cuda.device_count()
+                current_device = torch.cuda.current_device()
+                logger.info(f"사용 가능한 GPU 수: {gpu_count}, 현재 디바이스: {current_device}")
+                logger.info(f"현재 GPU: {torch.cuda.get_device_name(current_device)}")
+                
+                # GPU 리소스 설정
+                res = faiss.StandardGpuResources()
             
-            # 인덱스에 키 추가
-            logger.info("데이터를 FAISS 인덱스에 추가하는 중...")
-            keys_np = keys.cpu().numpy().astype('float32')
-            
-            # IVF 인덱스인 경우 학습 필요
-            if isinstance(self.faiss_index, faiss.IndexIVFFlat) or (hasattr(self.faiss_index, 'index') and isinstance(self.faiss_index.index, faiss.IndexIVFFlat)):
-                logger.info("IVF 인덱스 학습 중...")
-                train_start = time.time()
+            # 인덱스 유형 결정 및 생성
+            if data_size > 1000000:
+                # 대용량 데이터에는 IVF 인덱스 사용
+                nlist = min(4096, data_size // 100)  # 클러스터 수
+                logger.info(f"대용량 데이터 감지: IVF 인덱스 사용 (nlist={nlist})")
+                
+                # CPU에서 인덱스 생성
+                quantizer = faiss.IndexFlatL2(d)
+                cpu_index = faiss.IndexIVFFlat(quantizer, d, nlist, faiss.METRIC_L2)
+                cpu_index.nprobe = min(256, nlist // 4)  # 검색 시 탐색할 클러스터 수
                 
                 # 학습 데이터 샘플링 (메모리 절약)
+                logger.info("IVF 인덱스 학습 중...")
+                train_start = time.time()
                 max_train_points = min(1000000, len(keys_np))
                 if len(keys_np) > max_train_points:
                     indices = np.random.choice(len(keys_np), max_train_points, replace=False)
                     train_data = keys_np[indices]
                 else:
                     train_data = keys_np
-                    
-                self.faiss_index.train(train_data)
+                
+                # CPU에서 학습 수행
+                cpu_index.train(train_data)
                 logger.info(f"IVF 인덱스 학습 완료. 소요 시간: {time.time() - train_start:.1f}초")
+                
+                # GPU로 이동 (학습된 상태 유지)
+                if use_gpu:
+                    logger.info(f"학습된 IVF 인덱스를 GPU {current_device}로 이동합니다.")
+                    self.faiss_index = faiss.index_cpu_to_gpu(res, current_device, cpu_index)
+                    self.gpu_resources = res
+                    self.using_gpu = True
+                else:
+                    self.faiss_index = cpu_index
+                    self.using_gpu = False
+            else:
+                # 소규모 데이터에는 Flat 인덱스 사용
+                logger.info("소규모 데이터: Flat 인덱스 사용")
+                if use_gpu:
+                    # GPU Flat 인덱스 생성
+                    config = faiss.GpuIndexFlatConfig()
+                    config.device = current_device
+                    config.useFloat16 = False  # 정확도를 위해 float32 사용
+                    
+                    logger.info(f"GPU {current_device}에 Flat 인덱스를 생성합니다.")
+                    self.faiss_index = faiss.GpuIndexFlatL2(res, d, config)
+                    self.gpu_resources = res
+                    self.using_gpu = True
+                else:
+                    # CPU Flat 인덱스 생성
+                    self.faiss_index = faiss.IndexFlatL2(d)
+                    self.using_gpu = False
+            
+            # 인덱스에 키 추가
+            logger.info("데이터를 FAISS 인덱스에 추가하는 중...")
             
             # 메모리 효율성을 위해 배치로 추가
             batch_size = 10000  # 배치 크기 설정
