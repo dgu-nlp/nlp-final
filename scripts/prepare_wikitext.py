@@ -103,9 +103,9 @@ def download_wikitext(version: str = '2', target_dir: str = 'data'):
     """
     os.makedirs(target_dir, exist_ok=True)
     
-    # 다운로드 URL
-    url = f"https://s3.amazonaws.com/research.metamind.io/wikitext/wikitext-{version}-raw-v1.zip"
-    target_path = os.path.join(target_dir, f"wikitext-{version}-raw-v1.zip")
+    # 다운로드 URL (tar.gz 형식으로 변경)
+    url = f"https://s3.amazonaws.com/research.metamind.io/wikitext/wikitext-{version}-raw-v1.tar.gz"
+    target_path = os.path.join(target_dir, f"wikitext-{version}-raw-v1.tar.gz")
     
     # 다운로드
     if not os.path.exists(target_path):
@@ -125,10 +125,58 @@ def download_wikitext(version: str = '2', target_dir: str = 'data'):
     else:
         logger.info(f"WikiText-{version}가 이미 존재합니다: {target_path}")
     
-    # 압축 해제
-    import zipfile
-    with zipfile.ZipFile(target_path, 'r') as zip_ref:
-        zip_ref.extractall(target_dir)
+    # 압축 해제 - 파일 형식에 따라 적절한 방법 사용
+    extract_dir = os.path.join(target_dir, f"wikitext-{version}-raw")
+    
+    # 이미 압축 해제된 디렉토리가 있는지 확인
+    if os.path.exists(extract_dir) and os.path.isdir(extract_dir):
+        logger.info(f"이미 압축 해제된 디렉토리가 존재합니다: {extract_dir}")
+        return extract_dir
+    
+    # 파일 형식 확인 및 압축 해제
+    try:
+        if target_path.endswith('.tar.gz') or target_path.endswith('.tgz'):
+            logger.info(f"tar.gz 파일 압축 해제 중: {target_path}")
+            with tarfile.open(target_path, 'r:gz') as tar:
+                tar.extractall(path=target_dir)
+        elif target_path.endswith('.zip'):
+            logger.info(f"zip 파일 압축 해제 중: {target_path}")
+            import zipfile
+            with zipfile.ZipFile(target_path, 'r') as zip_ref:
+                zip_ref.extractall(target_dir)
+        else:
+            # 다른 형식 시도 (예: tar)
+            logger.info(f"알 수 없는 형식, tar 파일로 시도: {target_path}")
+            with tarfile.open(target_path, 'r') as tar:
+                tar.extractall(path=target_dir)
+    except Exception as e:
+        logger.error(f"압축 해제 중 오류 발생: {e}")
+        
+        # 직접 다운로드 및 압축 해제 방식 시도
+        logger.info("대체 다운로드 방식 시도...")
+        
+        # 대체 URL (Hugging Face 데이터셋)
+        alt_url = f"https://huggingface.co/datasets/wikitext/resolve/main/wikitext-{version}-raw-v1.zip"
+        alt_path = os.path.join(target_dir, f"wikitext-{version}-raw-v1-alt.zip")
+        
+        # 대체 다운로드
+        response = requests.get(alt_url, stream=True)
+        total_size = int(response.headers.get('content-length', 0))
+        
+        with open(alt_path, 'wb') as f, tqdm(
+            desc=f"Downloading WikiText-{version} (alternative)",
+            total=total_size,
+            unit='iB',
+            unit_scale=True
+        ) as pbar:
+            for data in response.iter_content(chunk_size=1024):
+                size = f.write(data)
+                pbar.update(size)
+        
+        # 대체 압축 해제
+        import zipfile
+        with zipfile.ZipFile(alt_path, 'r') as zip_ref:
+            zip_ref.extractall(target_dir)
         
     logger.info(f"WikiText-{version} 다운로드 및 압축 해제 완료")
     
