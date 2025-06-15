@@ -149,6 +149,36 @@ class KNNRetriever:
         # 실제 사용할 k 결정
         k = min(self.k, len(self.datastore))
         
+        # 차원 확인 및 처리
+        original_shape = query_vectors.shape
+        if len(original_shape) == 3:  # [batch_size, seq_len, hidden_size]
+            batch_size, seq_len, hidden_size = original_shape
+            # 마지막 시퀀스 위치의 벡터만 사용
+            query_vectors = query_vectors[:, -1, :]
+            logger.info(f"3D 텐서 감지: 마지막 시퀀스 위치의 벡터만 사용합니다. 새 형태: {query_vectors.shape}")
+        elif len(original_shape) == 2:  # [batch_size, hidden_size] 또는 [seq_len, hidden_size]
+            # 이미 올바른 형태일 수 있음
+            if original_shape[0] == 1 and original_shape[1] == self.datastore.hidden_size:
+                # 단일 샘플, 올바른 형태
+                pass
+            elif original_shape[1] != self.datastore.hidden_size:
+                # 첫 번째 차원이 배치가 아닌 시퀀스 길이인 경우
+                # 마지막 시퀀스 위치의 벡터만 사용
+                query_vectors = query_vectors[-1:, :]
+                logger.info(f"시퀀스 텐서 감지: 마지막 위치의 벡터만 사용합니다. 새 형태: {query_vectors.shape}")
+        elif len(original_shape) == 1:  # [hidden_size]
+            # 단일 벡터를 [1, hidden_size] 형태로 변환
+            query_vectors = query_vectors.unsqueeze(0)
+            logger.info(f"1D 텐서를 2D로 변환: {query_vectors.shape}")
+            
+        # 최종 형태 확인
+        if query_vectors.shape[1] != self.datastore.hidden_size:
+            logger.warning(f"쿼리 벡터 차원({query_vectors.shape[1]})이 데이터스토어 hidden_size({self.datastore.hidden_size})와 일치하지 않습니다.")
+            # 차원이 일치하지 않으면 전치 시도
+            if query_vectors.shape[0] == self.datastore.hidden_size:
+                query_vectors = query_vectors.transpose(0, 1)
+                logger.info(f"쿼리 벡터를 전치했습니다. 새 형태: {query_vectors.shape}")
+        
         if self.use_faiss and self.faiss_index is not None:
             try:
                 # FAISS 검색
@@ -166,7 +196,7 @@ class KNNRetriever:
                 indices = torch.from_numpy(indices).to(self.device)
                 
                 # 결과 검증
-                if distances.shape[0] != query_vectors.shape[0] or indices.shape[0] != query_vectors.shape[0]:
+                if distances.shape[0] != query_vectors.shape[0]:
                     logger.warning(f"FAISS 검색 결과 형태 불일치: 쿼리 배치 크기 {query_vectors.shape[0]}, 결과 크기 {distances.shape[0]}")
                     # 직접 계산으로 대체
                     return self._direct_search(query_vectors, k)
@@ -187,9 +217,9 @@ class KNNRetriever:
             # 데이터스토어 키를 동일한 디바이스로 이동
             keys = self.datastore.keys.to(query_vectors.device)
             
-            # 배치 처리를 위한 차원 확장
+            # 배치 처리를 위한 차원 확인
             if query_vectors.dim() == 1:
-                query_vectors = query_vectors.unsqueeze(0)
+                query_vectors = query_vectors.unsqueeze(0)  # [hidden_size] -> [1, hidden_size]
                 
             batch_size = query_vectors.size(0)
             distances_list = []
@@ -202,6 +232,20 @@ class KNNRetriever:
             for i in range(batch_size):
                 # 현재 쿼리 벡터
                 query = query_vectors[i].unsqueeze(0)  # [1, hidden_size]
+                
+                # 차원 확인
+                if query.shape[1] != keys.shape[1]:
+                    logger.warning(f"쿼리 차원({query.shape[1]})과 키 차원({keys.shape[1]})이 일치하지 않습니다.")
+                    # 차원이 일치하지 않으면 패딩 또는 잘라내기 시도
+                    if query.shape[1] < keys.shape[1]:
+                        # 패딩
+                        padding = torch.zeros(1, keys.shape[1] - query.shape[1], device=query.device)
+                        query = torch.cat([query, padding], dim=1)
+                        logger.info(f"쿼리 벡터를 패딩했습니다. 새 형태: {query.shape}")
+                    else:
+                        # 잘라내기
+                        query = query[:, :keys.shape[1]]
+                        logger.info(f"쿼리 벡터를 잘라냈습니다. 새 형태: {query.shape}")
                 
                 # 모든 키와의 유클리드 거리 계산 (직접 계산)
                 # L2 거리: ||a - b||^2 = ||a||^2 + ||b||^2 - 2*a·b
