@@ -34,6 +34,8 @@ class DataStore:
         self.size = 0
         self.is_built = False
         
+        logger.info(f"DataStore 초기화 완료: device={self.device}")
+        
     def build_from_model_and_data(self, model, dataloader, save_path: str = None, chunk_size: int = 1000000):
         """
         모델과 데이터로더를 사용하여 데이터스토어 구축
@@ -231,17 +233,57 @@ class DataStore:
         if not os.path.exists(path):
             raise FileNotFoundError(f" {path}")
             
-        data = torch.load(path, map_location='cpu')
+        data = torch.load(path, map_location=self.device)
         
-        self.keys = data['keys']
-        self.values = data['values']
-        self.contexts = data.get('contexts', [])
-        self.size = data['size']
-        self.hidden_size = data['hidden_size']
-        self.is_built = data['is_built']
+        # 데이터스토어 형식 확인
+        if isinstance(data, dict):
+            if 'keys' in data:
+                # 기본 형식
+                self.keys = data['keys'].to(self.device)
+                self.values = data['values'].to(self.device)
+                self.contexts = data.get('contexts', [])
+                self.size = data['size']
+                self.hidden_size = data['hidden_size']
+                self.is_built = data.get('is_built', True)
+                logger.info(f"{path} 로드. 크기: {self.size}, 디바이스: {self.device}")
+            elif 'chunk_count' in data:
+                # 청크로 나뉜 형식
+                logger.info(f"청크 데이터스토어 감지: {data['chunk_count']} 청크")
+                base_path = data['base_path']
+                
+                # 첫 번째 청크만 로드 (메모리 제한)
+                chunk_path = f"{base_path}_chunk0.pt"
+                if os.path.exists(chunk_path):
+                    chunk_data = torch.load(chunk_path, map_location=self.device)
+                    self.keys = chunk_data['keys'].to(self.device)
+                    self.values = chunk_data['values'].to(self.device)
+                    self.contexts = chunk_data.get('contexts', [])
+                    self.size = chunk_data['size']
+                    self.hidden_size = chunk_data['hidden_size']
+                    self.is_built = True
+                    
+                    logger.info(f"첫 번째 청크 로드 완료: {chunk_path} (크기: {self.size}, 디바이스: {self.device})")
+                else:
+                    raise FileNotFoundError(f"청크 파일을 찾을 수 없음: {chunk_path}")
+            else:
+                raise ValueError(f"인식할 수 없는 데이터스토어 형식: {list(data.keys())}")
+        else:
+            # 이전 형식 지원
+            self.keys = data
+            self.values = torch.load(path.replace('keys', 'values'), map_location=self.device)
+            self.size = len(self.keys)
+            logger.info(f"{path} 로드 (이전 형식). 크기: {self.size}")
         
-        logger.info(f"{path} 로드. 크기: {self.size}")
-        
+        # 데이터 타입 확인
+        if not isinstance(self.keys, torch.Tensor):
+            self.keys = torch.stack(self.keys)
+        if not isinstance(self.values, torch.Tensor):
+            self.values = torch.tensor(self.values, dtype=torch.long)
+            
+        # 디바이스 이동
+        self.keys = self.keys.to(self.device)
+        self.values = self.values.to(self.device)
+
     def get_subset(self, indices: torch.Tensor):
         """데이터스토어의 부분집합 반환"""
         return self.keys[indices], self.values[indices]

@@ -28,7 +28,8 @@ class KNNAugmentedGPT2(nn.Module):
                  knn_temperature: float = 10.0,
                  use_quality_filter: bool = True,
                  use_adaptive_interpolation: bool = False,
-                 vocab_size: int = 50257):
+                 vocab_size: int = 50257,
+                 device: Optional[torch.device] = None):
         """
         Args:
             base_model: 기본 GPT-2 모델
@@ -39,6 +40,7 @@ class KNNAugmentedGPT2(nn.Module):
             use_quality_filter: 품질 필터링 사용 여부
             use_adaptive_interpolation: 적응적 interpolation 사용 여부
             vocab_size: 어휘 크기
+            device: 디바이스
         """
         super().__init__()
         
@@ -65,6 +67,8 @@ class KNNAugmentedGPT2(nn.Module):
         if datastore is not None:
             self.initialize_retriever(knn_temperature)
             
+        self.device = device or torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        
     def initialize_retriever(self, temperature: float = 10.0):
         """k-NN 검색기 초기화"""
         if self.datastore is None or not self.datastore.is_built:
@@ -74,14 +78,27 @@ class KNNAugmentedGPT2(nn.Module):
             datastore=self.datastore,
             k=self.k,
             temperature=temperature,
-            use_faiss=True
+            use_faiss=True,
+            device=self.device
         )
         logger.info("k-NN 검색기가 초기화되었습니다.")
         
-    def set_datastore(self, datastore: DataStore, temperature: float = 10.0):
+    def set_datastore(self, datastore):
         """데이터스토어 설정"""
         self.datastore = datastore
-        self.initialize_retriever(temperature)
+        
+        # 디바이스 확인 및 조정
+        if hasattr(self, 'device') and hasattr(datastore, 'device') and datastore.device != self.device:
+            logger.warning(f"데이터스토어 디바이스({datastore.device})와 모델 디바이스({self.device})가 다릅니다.")
+            logger.info(f"데이터스토어를 {self.device}로 이동합니다.")
+            datastore.device = self.device
+            if hasattr(datastore, 'keys') and isinstance(datastore.keys, torch.Tensor):
+                datastore.keys = datastore.keys.to(self.device)
+            if hasattr(datastore, 'values') and isinstance(datastore.values, torch.Tensor):
+                datastore.values = datastore.values.to(self.device)
+        
+        # k-NN 검색기 초기화
+        self.initialize_retriever()
         
     def forward(self, 
                 input_ids: torch.Tensor, 
