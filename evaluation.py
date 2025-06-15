@@ -1,10 +1,10 @@
 # !/usr/bin/env python3
 
 """
-Quora paraphrase detection을 위한 평가.
+Evaluation code for Quora paraphrase detection.
 
-model_eval_paraphrase: 레이블 정보가 있는 dev 및 train dataloader에 적합함.
-model_test_paraphrase: 레이블 정보가 없는 test dataloader에 적합.
+model_eval_paraphrase is suitable for the dev (and train) dataloaders where the label information is available.
+model_test_paraphrase is suitable for the test dataloader where label information is not available.
 """
 
 import torch
@@ -66,7 +66,7 @@ def test_sonnet(
     test_path='predictions/generated_sonnets.txt',
     gold_path='data/TRUE_sonnets_held_out.txt'
 ):
-    chrf = CHRF()  # Character n-gram F-score
+    chrf = CHRF()
 
     # get the sonnets
     generated_sonnets = [x[1] for x in SonnetsDataset(test_path)]
@@ -78,3 +78,26 @@ def test_sonnet(
     # compute chrf
     chrf_score = chrf.corpus_score(generated_sonnets, [true_sonnets])
     return float(chrf_score.score)
+
+def test_sonnet_dev(
+    test_path='predictions/generated_sonnets.txt',
+    gold_path='data/TRUE_sonnets_held_out_dev.txt'
+):
+    chrf = CHRF()
+
+    # get the sonnets
+    generated_sonnets = [x[1] for x in SonnetsDataset(test_path)]
+    true_sonnets = [x[1] for x in SonnetsDataset(gold_path)]
+    max_len = min(len(true_sonnets), len(generated_sonnets))
+    true_sonnets = true_sonnets[:max_len]
+    generated_sonnets = generated_sonnets[:max_len]
+
+    # compute chrf
+    chrf_score = chrf.corpus_score(generated_sonnets, [true_sonnets])
+    return float(chrf_score.score)
+
+def main():
+  print(f"dev_set: {test_sonnet_dev()}") 
+
+if __name__ == "__main__":
+  main()
