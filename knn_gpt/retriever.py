@@ -74,7 +74,21 @@ class KNNRetriever:
         try:
             # CPU 인덱스 생성 (기본)
             logger.info(f"차원이 {d}인 FAISS 인덱스를 생성합니다.")
-            cpu_index = faiss.IndexFlatL2(d)
+            
+            # 데이터 크기에 따라 적절한 인덱스 선택
+            data_size = len(keys)
+            
+            if data_size > 1000000:
+                # 대용량 데이터에는 IVF 인덱스 사용
+                nlist = min(4096, data_size // 100)  # 클러스터 수
+                logger.info(f"대용량 데이터 감지: IVF 인덱스 사용 (nlist={nlist})")
+                quantizer = faiss.IndexFlatL2(d)
+                cpu_index = faiss.IndexIVFFlat(quantizer, d, nlist, faiss.METRIC_L2)
+                cpu_index.nprobe = min(256, nlist // 4)  # 검색 시 탐색할 클러스터 수
+            else:
+                # 소규모 데이터에는 Flat 인덱스 사용
+                logger.info("소규모 데이터: Flat 인덱스 사용")
+                cpu_index = faiss.IndexFlatL2(d)
             
             # GPU 사용 가능 여부 확인
             use_gpu = self.device.type == 'cuda' and torch.cuda.is_available()
@@ -97,7 +111,13 @@ class KNNRetriever:
                     
                     # GPU 인덱스 생성
                     logger.info(f"GPU {config.device}에 FAISS 인덱스를 생성합니다.")
-                    gpu_index = faiss.GpuIndexFlatL2(res, d, config)
+                    
+                    if isinstance(cpu_index, faiss.IndexIVFFlat):
+                        # IVF 인덱스를 GPU로 이동
+                        gpu_index = faiss.index_cpu_to_gpu(res, current_device, cpu_index)
+                    else:
+                        # Flat 인덱스를 GPU로 이동
+                        gpu_index = faiss.GpuIndexFlatL2(res, d, config)
                     
                     # 인덱스 확인
                     if not gpu_index:
@@ -122,6 +142,22 @@ class KNNRetriever:
             # 인덱스에 키 추가
             logger.info("데이터를 FAISS 인덱스에 추가하는 중...")
             keys_np = keys.cpu().numpy().astype('float32')
+            
+            # IVF 인덱스인 경우 학습 필요
+            if isinstance(self.faiss_index, faiss.IndexIVFFlat) or (hasattr(self.faiss_index, 'index') and isinstance(self.faiss_index.index, faiss.IndexIVFFlat)):
+                logger.info("IVF 인덱스 학습 중...")
+                train_start = time.time()
+                
+                # 학습 데이터 샘플링 (메모리 절약)
+                max_train_points = min(1000000, len(keys_np))
+                if len(keys_np) > max_train_points:
+                    indices = np.random.choice(len(keys_np), max_train_points, replace=False)
+                    train_data = keys_np[indices]
+                else:
+                    train_data = keys_np
+                    
+                self.faiss_index.train(train_data)
+                logger.info(f"IVF 인덱스 학습 완료. 소요 시간: {time.time() - train_start:.1f}초")
             
             # 메모리 효율성을 위해 배치로 추가
             batch_size = 10000  # 배치 크기 설정
@@ -152,13 +188,26 @@ class KNNRetriever:
             
             # 인덱스 검증
             logger.info("인덱스 검증 중...")
-            test_query = keys_np[:1]  # 첫 번째 키로 테스트
-            distances, indices = self.faiss_index.search(test_query, 1)
-            logger.info(f"FAISS 인덱스 검증: 테스트 쿼리에 대한 가장 가까운 인덱스 = {indices[0][0]}")
             
             # 인덱스 크기 확인
             if hasattr(self.faiss_index, 'ntotal'):
-                logger.info(f"인덱스에 추가된 총 벡터 수: {self.faiss_index.ntotal}")
+                index_size = self.faiss_index.ntotal
+                logger.info(f"인덱스에 추가된 총 벡터 수: {index_size}")
+                
+                if index_size != len(keys_np):
+                    logger.warning(f"인덱스 크기 불일치: 예상 {len(keys_np)}, 실제 {index_size}")
+            
+            # 테스트 쿼리로 검증
+            test_indices = np.random.choice(len(keys_np), min(5, len(keys_np)), replace=False)
+            for idx in test_indices:
+                test_query = keys_np[idx:idx+1]
+                distances, indices = self.faiss_index.search(test_query, 1)
+                
+                # 자기 자신이 가장 가까운 이웃이어야 함
+                if indices[0][0] == idx:
+                    logger.info(f"검증 성공: 인덱스 {idx}의 가장 가까운 이웃은 자기 자신입니다.")
+                else:
+                    logger.warning(f"검증 실패: 인덱스 {idx}의 가장 가까운 이웃은 {indices[0][0]}입니다.")
             
         except Exception as e:
             logger.error(f"FAISS 인덱스 구축 중 오류 발생: {e}")
@@ -216,26 +265,58 @@ class KNNRetriever:
                 query_vectors = query_vectors.transpose(0, 1)
                 logger.info(f"쿼리 벡터를 전치했습니다. 새 형태: {query_vectors.shape}")
         
-        if self.use_faiss and self.faiss_index is not None:
+        # 배치 크기 확인
+        batch_size = query_vectors.shape[0]
+        
+        # FAISS 검색 또는 직접 계산
+        if self.faiss_index is not None and self.use_faiss:
             try:
-                # FAISS 검색
-                query_np = query_vectors.cpu().numpy().astype('float32')
+                # 큰 배치 크기를 처리하기 위해 분할 처리
+                max_batch_size = 32  # FAISS 검색에 적합한 최대 배치 크기
                 
-                # 배치 처리를 위한 차원 확인
-                if query_np.ndim == 1:
-                    query_np = query_np.reshape(1, -1)  # [hidden_size] -> [1, hidden_size]
-                
-                # FAISS 검색 실행
-                distances, indices = self.faiss_index.search(query_np, k)
-                
-                # 텐서로 변환하고 디바이스로 이동
-                distances = torch.from_numpy(distances).to(self.device)
-                indices = torch.from_numpy(indices).to(self.device)
+                if batch_size > max_batch_size:
+                    logger.info(f"큰 배치 크기 감지: {batch_size}. {max_batch_size}씩 분할 처리합니다.")
+                    
+                    all_distances = []
+                    all_indices = []
+                    
+                    # 배치 분할 처리
+                    for i in range(0, batch_size, max_batch_size):
+                        end_idx = min(i + max_batch_size, batch_size)
+                        batch_queries = query_vectors[i:end_idx]
+                        
+                        # 현재 배치에 대한 FAISS 검색
+                        batch_queries_np = batch_queries.cpu().numpy().astype('float32')
+                        batch_distances, batch_indices = self.faiss_index.search(batch_queries_np, k)
+                        
+                        # 결과 수집
+                        all_distances.append(torch.from_numpy(batch_distances))
+                        all_indices.append(torch.from_numpy(batch_indices))
+                    
+                    # 결과 결합
+                    distances = torch.cat(all_distances, dim=0).to(self.device)
+                    indices = torch.cat(all_indices, dim=0).to(self.device)
+                    
+                else:
+                    # 작은 배치는 한 번에 처리
+                    query_np = query_vectors.cpu().numpy().astype('float32')
+                    distances, indices = self.faiss_index.search(query_np, k)
+                    
+                    # 텐서로 변환하고 디바이스로 이동
+                    distances = torch.from_numpy(distances).to(self.device)
+                    indices = torch.from_numpy(indices).to(self.device)
                 
                 # 결과 검증
                 if distances.shape[0] != query_vectors.shape[0]:
                     logger.warning(f"FAISS 검색 결과 형태 불일치: 쿼리 배치 크기 {query_vectors.shape[0]}, 결과 크기 {distances.shape[0]}")
                     # 직접 계산으로 대체
+                    return self._direct_search(query_vectors, k)
+                
+                # 검색 결과 검증
+                valid_indices = (indices >= 0) & (indices < len(self.datastore))
+                if not valid_indices.all():
+                    invalid_count = (~valid_indices).sum().item()
+                    logger.warning(f"유효하지 않은 인덱스 발견: {invalid_count}개. 직접 계산으로 대체합니다.")
                     return self._direct_search(query_vectors, k)
                 
                 return distances, indices
@@ -246,6 +327,7 @@ class KNNRetriever:
                 return self._direct_search(query_vectors, k)
         else:
             # 직접 거리 계산
+            logger.info("FAISS 인덱스가 없거나 비활성화되어 있습니다. 직접 거리 계산을 사용합니다.")
             return self._direct_search(query_vectors, k)
         
     def _direct_search(self, query_vectors: torch.Tensor, k: int) -> Tuple[torch.Tensor, torch.Tensor]:

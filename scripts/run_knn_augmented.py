@@ -122,25 +122,56 @@ def load_datastore(task: str, args: argparse.Namespace) -> DataStore:
                 datastore.size = data['size']
                 datastore.hidden_size = data['hidden_size']
                 datastore.is_built = data.get('is_built', True)
+                logger.info(f"단일 데이터스토어 로드 완료. 크기: {datastore.size}")
             elif 'chunk_count' in data:
                 # 청크로 나뉜 형식
-                logger.info(f"청크 데이터스토어 감지: {data['chunk_count']} 청크")
+                chunk_count = data['chunk_count']
                 base_path = data['base_path']
+                logger.info(f"청크 데이터스토어 감지: {chunk_count} 청크")
                 
-                # 첫 번째 청크만 로드 (메모리 제한)
-                chunk_path = f"{base_path}_chunk0.pt"
-                if os.path.exists(chunk_path):
-                    chunk_data = torch.load(chunk_path, map_location=device)
-                    datastore.keys = chunk_data['keys'].to(device)
-                    datastore.values = chunk_data['values'].to(device)
-                    datastore.contexts = chunk_data.get('contexts', [])
-                    datastore.size = chunk_data['size']
-                    datastore.hidden_size = chunk_data['hidden_size']
+                # 로드할 최대 청크 수 설정 (메모리 제한 고려)
+                max_chunks = min(chunk_count, args.max_chunks) if hasattr(args, 'max_chunks') and args.max_chunks > 0 else chunk_count
+                logger.info(f"최대 {max_chunks}개 청크를 로드합니다.")
+                
+                all_keys = []
+                all_values = []
+                all_contexts = []
+                total_size = 0
+                
+                # 청크 로드
+                for i in range(max_chunks):
+                    chunk_path = f"{base_path}_chunk{i+1}.pt"
+                    if os.path.exists(chunk_path):
+                        logger.info(f"청크 {i+2}/{max_chunks} 로드 중: {chunk_path}")
+                        chunk_data = torch.load(chunk_path, map_location=device)
+                        
+                        # 청크 데이터 추가
+                        chunk_keys = chunk_data['keys'].to(device)
+                        chunk_values = chunk_data['values'].to(device)
+                        chunk_contexts = chunk_data.get('contexts', [])
+                        chunk_size = chunk_data['size']
+                        
+                        all_keys.append(chunk_keys)
+                        all_values.append(chunk_values)
+                        all_contexts.extend(chunk_contexts)
+                        total_size += chunk_size
+                        
+                        logger.info(f"청크 {i+1} 로드 완료: 크기 {chunk_size}")
+                    else:
+                        logger.warning(f"청크 파일을 찾을 수 없음: {chunk_path}")
+                
+                # 모든 청크 데이터 결합
+                if all_keys:
+                    datastore.keys = torch.cat(all_keys, dim=0)
+                    datastore.values = torch.cat(all_values, dim=0)
+                    datastore.contexts = all_contexts
+                    datastore.size = total_size
+                    datastore.hidden_size = all_keys[0].shape[1]
                     datastore.is_built = True
                     
-                    logger.info(f"첫 번째 청크 로드 완료: {chunk_path} (크기: {datastore.size})")
+                    logger.info(f"총 {max_chunks}개 청크 로드 완료. 총 크기: {total_size}, 형태: {datastore.keys.shape}")
                 else:
-                    raise FileNotFoundError(f"청크 파일을 찾을 수 없음: {chunk_path}")
+                    raise ValueError("로드된 청크가 없습니다.")
             else:
                 raise ValueError(f"인식할 수 없는 데이터스토어 형식: {list(data.keys())}")
         else:
@@ -372,6 +403,8 @@ def main():
                         help="WikiText 버전")
     parser.add_argument("--data_dir", type=str, default='data',
                         help="데이터 디렉토리")
+    parser.add_argument("--max_chunks", type=int, default=3,
+                        help="로드할 최대 청크 수 (기본값: 3, 메모리 제한 고려)")
     
     # 모델 관련 인수
     parser.add_argument("--epochs", type=int, default=10,
