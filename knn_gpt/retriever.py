@@ -97,32 +97,61 @@ class KNNRetriever:
                 nlist = min(4096, data_size // 100)  # 클러스터 수
                 logger.info(f"대용량 데이터 감지: IVF 인덱스 사용 (nlist={nlist})")
                 
-                # CPU에서 인덱스 생성
-                quantizer = faiss.IndexFlatL2(d)
-                cpu_index = faiss.IndexIVFFlat(quantizer, d, nlist, faiss.METRIC_L2)
-                cpu_index.nprobe = min(256, nlist // 4)  # 검색 시 탐색할 클러스터 수
-                
-                # 학습 데이터 샘플링 (메모리 절약)
-                logger.info("IVF 인덱스 학습 중...")
-                train_start = time.time()
-                max_train_points = min(1000000, len(keys_np))
-                if len(keys_np) > max_train_points:
-                    indices = np.random.choice(len(keys_np), max_train_points, replace=False)
-                    train_data = keys_np[indices]
-                else:
-                    train_data = keys_np
-                
-                # CPU에서 학습 수행
-                cpu_index.train(train_data)
-                logger.info(f"IVF 인덱스 학습 완료. 소요 시간: {time.time() - train_start:.1f}초")
-                
-                # GPU로 이동 (학습된 상태 유지)
                 if use_gpu:
-                    logger.info(f"학습된 IVF 인덱스를 GPU {current_device}로 이동합니다.")
-                    self.faiss_index = faiss.index_cpu_to_gpu(res, current_device, cpu_index)
+                    # GPU에서 직접 Flat 인덱스 사용 (더 간단하고 안정적)
+                    logger.info(f"대용량 데이터에 GPU Flat 인덱스 사용")
+                    config = faiss.GpuIndexFlatConfig()
+                    config.device = current_device
+                    config.useFloat16 = False  # 정확도를 위해 float32 사용
+                    
+                    self.faiss_index = faiss.GpuIndexFlatL2(res, d, config)
                     self.gpu_resources = res
                     self.using_gpu = True
+                    
+                    # 배치로 데이터 추가
+                    batch_size = 100000  # 더 큰 배치 크기 사용
+                    for i in range(0, len(keys_np), batch_size):
+                        end_idx = min(i + batch_size, len(keys_np))
+                        self.faiss_index.add(keys_np[i:end_idx])
+                        logger.info(f"GPU 인덱스 구축 진행률: {end_idx/len(keys_np)*100:.1f}%")
                 else:
+                    # CPU에서 인덱스 생성
+                    quantizer = faiss.IndexFlatL2(d)
+                    cpu_index = faiss.IndexIVFFlat(quantizer, d, nlist, faiss.METRIC_L2)
+                    cpu_index.nprobe = min(256, nlist // 4)  # 검색 시 탐색할 클러스터 수
+                    
+                    # CPU에서 학습
+                    logger.info("CPU에서 IVF 인덱스 학습 중...")
+                    train_start = time.time()
+                    cpu_index.train(keys_np)
+                    logger.info(f"CPU IVF 인덱스 학습 완료. 소요 시간: {time.time() - train_start:.1f}초")
+                    
+                    # 인덱스에 데이터 추가
+                    logger.info("데이터를 CPU 인덱스에 추가하는 중...")
+                    
+                    # 메모리 효율성을 위해 배치로 추가
+                    batch_size = 10000  # 배치 크기 설정
+                    num_batches = (len(keys_np) + batch_size - 1) // batch_size  # 올림 나눗셈
+                    
+                    logger.info(f"총 {num_batches}개 배치로 {len(keys_np)}개 벡터를 추가합니다. (배치 크기: {batch_size})")
+                    
+                    # 시작 시간 기록
+                    start_time = time.time()
+                    
+                    for i in range(num_batches):
+                        start_idx = i * batch_size
+                        end_idx = min((i + 1) * batch_size, len(keys_np))
+                        batch = keys_np[start_idx:end_idx]
+                        
+                        # 배치 추가
+                        cpu_index.add(batch)
+                        
+                        # 진행 상황 보고 (10% 단위)
+                        if (i + 1) % max(1, num_batches // 10) == 0 or i == num_batches - 1:
+                            progress = (i + 1) / num_batches * 100
+                            elapsed = time.time() - start_time
+                            logger.info(f"인덱스 구축 진행률: {progress:.1f}% ({i+1}/{num_batches} 배치, 경과 시간: {elapsed:.1f}초)")
+                    
                     self.faiss_index = cpu_index
                     self.using_gpu = False
             else:
@@ -138,40 +167,70 @@ class KNNRetriever:
                     self.faiss_index = faiss.GpuIndexFlatL2(res, d, config)
                     self.gpu_resources = res
                     self.using_gpu = True
+                    
+                    # 인덱스에 데이터 추가
+                    logger.info("데이터를 GPU 인덱스에 추가하는 중...")
+                    
+                    # 메모리 효율성을 위해 배치로 추가
+                    batch_size = 5000  # 배치 크기 축소
+                    num_batches = (len(keys_np) + batch_size - 1) // batch_size  # 올림 나눗셈
+                    
+                    logger.info(f"총 {num_batches}개 배치로 {len(keys_np)}개 벡터를 추가합니다. (배치 크기: {batch_size})")
+                    
+                    # 시작 시간 기록
+                    start_time = time.time()
+                    
+                    for i in range(num_batches):
+                        start_idx = i * batch_size
+                        end_idx = min((i + 1) * batch_size, len(keys_np))
+                        batch = keys_np[start_idx:end_idx]
+                        
+                        # 배치 추가
+                        self.faiss_index.add(batch)
+                        
+                        # 진행 상황 보고 (10% 단위)
+                        if (i + 1) % max(1, num_batches // 10) == 0 or i == num_batches - 1:
+                            progress = (i + 1) / num_batches * 100
+                            elapsed = time.time() - start_time
+                            logger.info(f"인덱스 구축 진행률: {progress:.1f}% ({i+1}/{num_batches} 배치, 경과 시간: {elapsed:.1f}초)")
+                    
+                    # 총 소요 시간
+                    total_time = time.time() - start_time
+                    logger.info(f"GPU 인덱스 구축 완료. 총 {len(keys)}개 벡터, 소요 시간: {total_time:.1f}초")
                 else:
                     # CPU Flat 인덱스 생성
                     self.faiss_index = faiss.IndexFlatL2(d)
                     self.using_gpu = False
-            
-            # 인덱스에 키 추가
-            logger.info("데이터를 FAISS 인덱스에 추가하는 중...")
-            
-            # 메모리 효율성을 위해 배치로 추가
-            batch_size = 10000  # 배치 크기 설정
-            num_batches = (len(keys_np) + batch_size - 1) // batch_size  # 올림 나눗셈
-            
-            logger.info(f"총 {num_batches}개 배치로 {len(keys_np)}개 벡터를 추가합니다. (배치 크기: {batch_size})")
-            
-            # 시작 시간 기록
-            start_time = time.time()
-            
-            for i in range(num_batches):
-                start_idx = i * batch_size
-                end_idx = min((i + 1) * batch_size, len(keys_np))
-                batch = keys_np[start_idx:end_idx]
-                
-                # 배치 추가
-                self.faiss_index.add(batch)
-                
-                # 진행 상황 보고 (10% 단위)
-                if (i + 1) % max(1, num_batches // 10) == 0 or i == num_batches - 1:
-                    progress = (i + 1) / num_batches * 100
-                    elapsed = time.time() - start_time
-                    logger.info(f"인덱스 구축 진행률: {progress:.1f}% ({i+1}/{num_batches} 배치, 경과 시간: {elapsed:.1f}초)")
-                
-            # 총 소요 시간
-            total_time = time.time() - start_time
-            logger.info(f"FAISS 인덱스 구축 완료. 총 {len(keys)}개 벡터, 소요 시간: {total_time:.1f}초")
+                    
+                    # 인덱스에 데이터 추가
+                    logger.info("데이터를 CPU 인덱스에 추가하는 중...")
+                    
+                    # 메모리 효율성을 위해 배치로 추가
+                    batch_size = 10000  # 배치 크기 설정
+                    num_batches = (len(keys_np) + batch_size - 1) // batch_size  # 올림 나눗셈
+                    
+                    logger.info(f"총 {num_batches}개 배치로 {len(keys_np)}개 벡터를 추가합니다. (배치 크기: {batch_size})")
+                    
+                    # 시작 시간 기록
+                    start_time = time.time()
+                    
+                    for i in range(num_batches):
+                        start_idx = i * batch_size
+                        end_idx = min((i + 1) * batch_size, len(keys_np))
+                        batch = keys_np[start_idx:end_idx]
+                        
+                        # 배치 추가
+                        self.faiss_index.add(batch)
+                        
+                        # 진행 상황 보고 (10% 단위)
+                        if (i + 1) % max(1, num_batches // 10) == 0 or i == num_batches - 1:
+                            progress = (i + 1) / num_batches * 100
+                            elapsed = time.time() - start_time
+                            logger.info(f"인덱스 구축 진행률: {progress:.1f}% ({i+1}/{num_batches} 배치, 경과 시간: {elapsed:.1f}초)")
+                    
+                    # 총 소요 시간
+                    total_time = time.time() - start_time
+                    logger.info(f"CPU 인덱스 구축 완료. 총 {len(keys)}개 벡터, 소요 시간: {total_time:.1f}초")
             
             # 인덱스 검증
             logger.info("인덱스 검증 중...")
@@ -195,6 +254,10 @@ class KNNRetriever:
                     logger.info(f"검증 성공: 인덱스 {idx}의 가장 가까운 이웃은 자기 자신입니다.")
                 else:
                     logger.warning(f"검증 실패: 인덱스 {idx}의 가장 가까운 이웃은 {indices[0][0]}입니다.")
+            
+            # 인덱스 최적화
+            self.optimize_index_for_search()
+            logger.info("인덱스 구축 및 최적화 완료.")
             
         except Exception as e:
             logger.error(f"FAISS 인덱스 구축 중 오류 발생: {e}")
@@ -261,6 +324,13 @@ class KNNRetriever:
                 # 큰 배치 크기를 처리하기 위해 분할 처리
                 max_batch_size = 32  # FAISS 검색에 적합한 최대 배치 크기
                 
+                # FAISS 인덱스가 CPU에 있고 쿼리가 GPU에 있는 경우 처리
+                query_device = query_vectors.device
+                using_cpu_index = not self.using_gpu
+                
+                if using_cpu_index:
+                    logger.info(f"CPU FAISS 인덱스 사용 중: 쿼리를 CPU로 이동합니다.")
+                
                 if batch_size > max_batch_size:
                     logger.info(f"큰 배치 크기 감지: {batch_size}. {max_batch_size}씩 분할 처리합니다.")
                     
@@ -281,17 +351,17 @@ class KNNRetriever:
                         all_indices.append(torch.from_numpy(batch_indices))
                     
                     # 결과 결합
-                    distances = torch.cat(all_distances, dim=0).to(self.device)
-                    indices = torch.cat(all_indices, dim=0).to(self.device)
+                    distances = torch.cat(all_distances, dim=0).to(query_device)
+                    indices = torch.cat(all_indices, dim=0).to(query_device)
                     
                 else:
                     # 작은 배치는 한 번에 처리
                     query_np = query_vectors.cpu().numpy().astype('float32')
                     distances, indices = self.faiss_index.search(query_np, k)
                     
-                    # 텐서로 변환하고 디바이스로 이동
-                    distances = torch.from_numpy(distances).to(self.device)
-                    indices = torch.from_numpy(indices).to(self.device)
+                    # 텐서로 변환하고 원래 쿼리 디바이스로 이동
+                    distances = torch.from_numpy(distances).to(query_device)
+                    indices = torch.from_numpy(indices).to(query_device)
                 
                 # 결과 검증
                 if distances.shape[0] != query_vectors.shape[0]:
@@ -547,4 +617,59 @@ class KNNRetriever:
         batch_size, k = indices.shape
         gathered_values = torch.gather(values.unsqueeze(0).expand(batch_size, -1), 1, indices)
         
-        return gathered_values 
+        return gathered_values
+        
+    def set_nprobe(self, nprobe: int) -> bool:
+        """
+        IVF 인덱스의 nprobe 파라미터 설정 (검색할 클러스터 수)
+        
+        Args:
+            nprobe: 검색할 클러스터 수
+            
+        Returns:
+            bool: 설정 성공 여부
+        """
+        if self.faiss_index is None or not hasattr(self.faiss_index, 'nprobe'):
+            logger.warning("현재 인덱스는 IVF 타입이 아니거나 존재하지 않아 nprobe를 설정할 수 없습니다.")
+            return False
+            
+        # nprobe 범위 제한
+        nlist = self.faiss_index.nlist if hasattr(self.faiss_index, 'nlist') else 1
+        valid_nprobe = max(1, min(nprobe, nlist))
+        
+        if valid_nprobe != nprobe:
+            logger.warning(f"nprobe 값이 조정되었습니다: {nprobe} -> {valid_nprobe} (nlist: {nlist})")
+            
+        self.faiss_index.nprobe = valid_nprobe
+        logger.info(f"nprobe 설정 완료: {valid_nprobe}")
+        return True
+        
+    def optimize_index_for_search(self):
+        """
+        검색 성능 최적화를 위한 인덱스 설정
+        """
+        if self.faiss_index is None:
+            logger.warning("인덱스가 존재하지 않아 최적화할 수 없습니다.")
+            return
+            
+        # IVF 인덱스 최적화
+        if hasattr(self.faiss_index, 'nprobe'):
+            nlist = self.faiss_index.nlist if hasattr(self.faiss_index, 'nlist') else 1
+            
+            # 데이터 크기에 따라 적절한 nprobe 설정
+            data_size = len(self.datastore)
+            if data_size > 5000000:
+                # 매우 큰 데이터셋
+                nprobe = min(512, nlist // 2)
+            elif data_size > 1000000:
+                # 큰 데이터셋
+                nprobe = min(256, nlist // 4)
+            else:
+                # 중소형 데이터셋
+                nprobe = min(128, nlist // 8)
+                
+            self.set_nprobe(nprobe)
+            logger.info(f"데이터 크기({data_size})에 맞게 nprobe 최적화: {nprobe}")
+            
+        # 기타 인덱스 타입별 최적화
+        # (향후 확장 가능) 
