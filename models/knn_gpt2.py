@@ -69,6 +69,8 @@ class KNNAugmentedGPT2(nn.Module):
             
         self.device = device or torch.device('cuda' if torch.cuda.is_available() else 'cpu')
         
+        self.tokenizer = getattr(base_model, 'tokenizer', None)
+        
     def initialize_retriever(self, temperature: float = 10.0):
         """k-NN 검색기 초기화"""
         if self.datastore is None or not self.datastore.is_built:
@@ -247,7 +249,21 @@ class KNNAugmentedGPT2(nn.Module):
             for _ in range(max_length):
                 # Forward pass
                 outputs = self.forward(generated_ids, current_attention_mask)
-                next_token_logits = outputs['logits'][:, -1, :] / temperature
+                # outputs['logits'] can be either 2D ([batch, vocab]) or 3D ([batch, seq_len, vocab]).
+                logits_tensor = outputs['logits']
+                if logits_tensor.dim() == 3:
+                    # Standard case when logits are provided for each timestep.
+                    next_token_logits = logits_tensor[:, -1, :] / temperature
+                elif logits_tensor.dim() == 2:
+                    # k-NN forward returns only the last-token logits (batch, vocab)
+                    next_token_logits = logits_tensor / temperature
+                else:
+                    raise ValueError(f"Unexpected logits dimension: {logits_tensor.dim()}")
+                
+                # EOS 토큰은 첫 토큰으로 뽑히지 않도록 확률을 -Inf 로 마스킹
+                if getattr(self, 'tokenizer', None) is not None:
+                    eos_id = self.tokenizer.eos_token_id
+                    next_token_logits[:, eos_id] = -float('Inf')
                 
                 if do_sample:
                     # Top-p (nucleus) sampling
@@ -270,10 +286,16 @@ class KNNAugmentedGPT2(nn.Module):
                     # Greedy sampling
                     next_token = torch.argmax(next_token_logits, dim=-1, keepdim=True)
                 
-                # Check for EOS token
-                if hasattr(self.base_model, 'tokenizer'):
-                    if next_token.item() == self.base_model.tokenizer.eos_token_id:
-                        break
+                # EOS 토큰 여부 확인 (base_model 또는 self에 tokenizer가 있을 수 있음)
+                eos_id = None
+                # 우선 base_model에 유효한 tokenizer가 있는지 확인
+                if hasattr(self.base_model, 'tokenizer') and self.base_model.tokenizer is not None:
+                    eos_id = self.base_model.tokenizer.eos_token_id
+                # 그 외 self.tokenizer 사용 (주입된 경우)
+                elif getattr(self, 'tokenizer', None) is not None:
+                    eos_id = self.tokenizer.eos_token_id
+                if eos_id is not None and next_token.item() == eos_id:
+                    break
                 
                 # Append generated token
                 generated_ids = torch.cat([generated_ids, next_token], dim=-1)
@@ -284,9 +306,14 @@ class KNNAugmentedGPT2(nn.Module):
                               dtype=current_attention_mask.dtype)
                 ], dim=-1)
         
-        # Decode generated text
-        if hasattr(self.base_model, 'tokenizer'):
+        # 결과 디코딩 (가능한 tokenizer 사용)
+        if hasattr(self.base_model, 'tokenizer') and self.base_model.tokenizer is not None:
             generated_text = self.base_model.tokenizer.decode(
+                generated_ids[0].cpu().tolist(), 
+                skip_special_tokens=True
+            )
+        elif getattr(self, 'tokenizer', None) is not None:
+            generated_text = self.tokenizer.decode(
                 generated_ids[0].cpu().tolist(), 
                 skip_special_tokens=True
             )

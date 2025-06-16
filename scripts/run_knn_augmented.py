@@ -23,7 +23,7 @@ from knn_gpt import DataStore
 from models.knn_gpt2 import KNNAugmentedGPT2
 from paraphrase_detection import ParaphraseGPT
 from sonnet_generation import SonnetGPT
-from datasets import load_paraphrase_data, ParaphraseDetectionDataset, ParaphraseDetectionTestDataset, SonnetsDataset
+from datasets import (load_paraphrase_data, ParaphraseDetectionDataset, ParaphraseDetectionTestDataset, SonnetsDataset)
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -79,6 +79,10 @@ def load_knn_model(task: str, args: argparse.Namespace) -> KNNAugmentedGPT2:
             use_adaptive_interpolation=args.use_adaptive_interpolation,
             vocab_size=base_model.gpt.word_embedding.num_embeddings
         )
+        
+        # SonnetGPT 래퍼에는 tokenizer가 있으나, knn_model은 GPT2Model만 기반이므로 직접 주입한다.
+        if hasattr(base_model, 'tokenizer'):
+            knn_model.tokenizer = base_model.tokenizer
         
     else:
         raise ValueError(f"지원되지 않는 작업: {task}")
@@ -310,34 +314,29 @@ def run_sonnet_generation(args: argparse.Namespace):
         logger.error(f"데이터스토어 로드 중 오류 발생: {e}")
         raise
     
-    # 토크나이저
+    # 토크나이저 (위에서 주입한 것을 그대로 사용)
     tokenizer = base_model.tokenizer
     
-    # 시작 프롬프트
-    prompts = [
-        "Shall I compare thee to a summer's day?",
-        "My mistress' eyes are nothing like the sun",
-        "When I do count the clock that tells the time"
-    ]
+    # 평가용 held-out 소넷 데이터셋 로드 (전체 행을 prompt 로 사용)
+    held_out_path = getattr(args, 'held_out_path', 'data/sonnets_held_out.txt')
+    held_out_dataset = SonnetsDataset(held_out_path)
     
+    # 디바이스 설정 후 모델 이동
     device = torch.device('cuda' if args.use_gpu and torch.cuda.is_available() else 'cpu')
     knn_model = knn_model.to(device)
     
-    # 결과 저장을 위한 딕셔너리
     results = []
-    
-    logger.info("\nk-NN 증강 모드로 생성 중...")
+
+    logger.info("\nk-NN 증강 모드로 held-out 소넷 생성 중...")
     model = knn_model
     model.eval()
-    
-    for prompt in prompts:
-        # 입력 토큰화
-        inputs = tokenizer(prompt, return_tensors='pt')
-        input_ids = inputs['input_ids'].to(device)
-        attention_mask = inputs['attention_mask'].to(device)
-        
+
+    for (sid, sonnet_prompt) in held_out_dataset:
         try:
-            # 텍스트 생성
+            inputs = tokenizer(sonnet_prompt, return_tensors='pt', padding=False, truncation=True)
+            input_ids = inputs['input_ids'].to(device)
+            attention_mask = inputs['attention_mask'].to(device)
+
             generated_ids, generated_text = model.generate(
                 input_ids=input_ids,
                 attention_mask=attention_mask,
@@ -346,31 +345,26 @@ def run_sonnet_generation(args: argparse.Namespace):
                 top_p=args.top_p,
                 do_sample=args.do_sample
             )
-            
-            logger.info(f"\n프롬프트: {prompt}")
-            logger.info(f"생성된 텍스트:\n{generated_text}")
-            
-            # 결과 저장
+
+            logger.info(f"[{sid}] 생성 완료")
+
             results.append({
-                'prompt': prompt,
-                'generated_text': generated_text
+                'id': sid,  # 유지: SonnetsDataset는 0-based ID를 그대로 사용
+                'generated_text': generated_text.strip()
             })
         except Exception as e:
-            logger.error(f"텍스트 생성 중 오류 발생: {e}")
-            logger.warning(f"프롬프트 '{prompt}'에 대한 생성을 건너뜁니다.")
+            logger.error(f"소넷 {sid} 생성 중 오류: {e}")
             continue
-    
-    # 결과 파일로 저장
-    datastore_type = 'wikitext' if args.use_wikitext else 'default'
-    
-    # kNN 모델 결과 저장
-    knn_output_file = f'predictions/knn_generated_sonnets_{datastore_type}_k{args.k}.txt'
-    with open(knn_output_file, "w+") as f:
-        f.write("--Generated Sonnets (k-NN Model)--\n\n")
-        for i, result in enumerate(results):
-            f.write(f"\nPrompt {i+1}: {result['prompt']}\n")
-            f.write(f"{result['generated_text']}\n\n")
-    logger.info(f"k-NN 모델 생성 결과를 {knn_output_file}에 저장했습니다.")
+
+    # 평가 스크립트에서 기대하는 동일 형식으로 저장
+    output_file = 'predictions/knn_generated_sonnets.txt'
+    with open(output_file, 'w', encoding='utf-8') as f:
+        f.write('--Generated Sonnets-- \n\n')
+        for res in results:
+            f.write(f"\n{res['id']}\n")
+            f.write(res['generated_text'] + "\n\n")
+
+    logger.info(f"k-NN 모델 생성 결과를 {output_file} 에 저장했습니다.")
 
 
 def main():
