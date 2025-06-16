@@ -1,0 +1,10 @@
+{
+  "parameters": {
+    "k": 8,
+    "lambda_knn": 0.25,
+    "knn_temperature": 10.0,
+    "use_quality_filter": false,
+    "use_adaptive_interpolation": false,
+    "datastore_type": "default"
+  }
+}
