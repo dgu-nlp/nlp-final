@@ -58,7 +58,6 @@ cd nlp-final
 ```
 conda env create -f env.yml
 conda activate nlp_final
-pip install datasets
 ```
 #### 4. 기본 과제 실행
 ```
