@@ -95,44 +95,86 @@ class WikiTextDataset(Dataset):
 
 def download_wikitext(version: str = '2', target_dir: str = 'data'):
     """
-    WikiText 데이터셋 다운로드
+    WikiText 데이터셋 준비 - datasets 라이브러리 사용
     
     Args:
         version: WikiText 버전 ('2' 또는 '103')
         target_dir: 저장할 디렉토리
     """
+    try:
+        from datasets import load_dataset
+    except ImportError:
+        logger.error("datasets 라이브러리가 설치되어 있지 않습니다. 설치하려면 다음 명령어를 실행하세요:")
+        logger.error("pip install datasets")
+        sys.exit(1)
+    
     os.makedirs(target_dir, exist_ok=True)
     
-    # 다운로드 URL
-    url = f"https://s3.amazonaws.com/research.metamind.io/wikitext/wikitext-{version}-raw-v1.zip"
-    target_path = os.path.join(target_dir, f"wikitext-{version}-raw-v1.zip")
+    # 데이터 디렉토리 설정
+    extract_dir = os.path.join(target_dir, f"wikitext-{version}-raw")
+    os.makedirs(extract_dir, exist_ok=True)
     
-    # 다운로드
-    if not os.path.exists(target_path):
-        logger.info(f"WikiText-{version} 다운로드 중...")
-        response = requests.get(url, stream=True)
-        total_size = int(response.headers.get('content-length', 0))
+    # 필요한 파일 경로 설정
+    train_file = os.path.join(extract_dir, "wiki.train.raw")
+    valid_file = os.path.join(extract_dir, "wiki.valid.raw")
+    test_file = os.path.join(extract_dir, "wiki.test.raw")
+    
+    # datasets 라이브러리를 사용하여 WikiText 데이터셋 로드
+    logger.info(f"WikiText-{version}-raw 데이터셋 로드 중...")
+    dataset_name = f"wikitext-{version}-raw-v1"
+    try:
+        dataset = load_dataset("wikitext", dataset_name)
+        logger.info(f"WikiText 데이터셋 로드 완료: {dataset}")
+    except Exception as e:
+        logger.error(f"WikiText 데이터셋 로드 중 오류 발생: {e}")
+        sys.exit(1)
+    
+    # 데이터셋을 파일로 저장
+    def save_dataset_split(split, output_file):
+        if os.path.exists(output_file):
+            logger.info(f"파일이 이미 존재합니다: {output_file}")
+            return
+            
+        logger.info(f"데이터셋 {split} 분할을 파일로 저장 중: {output_file}")
+        with open(output_file, 'w', encoding='utf-8') as f:
+            for item in dataset[split]:
+                f.write(item['text'] + '\n')
+    
+    # 각 분할을 파일로 저장
+    save_dataset_split('train', train_file)
+    save_dataset_split('validation', valid_file)
+    save_dataset_split('test', test_file)
+    
+    logger.info(f"WikiText-{version} 데이터 준비 완료")
+    return extract_dir
+
+
+class GPT2ModelWrapper:
+    """
+    GPT2Model 래퍼 클래스
+    DataStore가 model.gpt를 호출할 수 있도록 함
+    """
+    def __init__(self, model):
+        self.model = model
+        self.gpt = model
         
-        with open(target_path, 'wb') as f, tqdm(
-            desc=f"Downloading WikiText-{version}",
-            total=total_size,
-            unit='iB',
-            unit_scale=True
-        ) as pbar:
-            for data in response.iter_content(chunk_size=1024):
-                size = f.write(data)
-                pbar.update(size)
-    else:
-        logger.info(f"WikiText-{version}가 이미 존재합니다: {target_path}")
-    
-    # 압축 해제
-    import zipfile
-    with zipfile.ZipFile(target_path, 'r') as zip_ref:
-        zip_ref.extractall(target_dir)
+    def __call__(self, input_ids, attention_mask):
+        return self.model(input_ids, attention_mask)
         
-    logger.info(f"WikiText-{version} 다운로드 및 압축 해제 완료")
-    
-    return os.path.join(target_dir, f"wikitext-{version}-raw")
+    def eval(self):
+        """모델을 평가 모드로 설정"""
+        self.model.eval()
+        return self
+        
+    def train(self, mode=True):
+        """모델을 학습 모드로 설정"""
+        self.model.train(mode)
+        return self
+        
+    def to(self, device):
+        """모델을 지정된 디바이스로 이동"""
+        self.model = self.model.to(device)
+        return self
 
 
 def prepare_wikitext_datastore(args):
@@ -168,13 +210,17 @@ def prepare_wikitext_datastore(args):
     model = GPT2Model.from_pretrained('gpt2')
     model = model.to(device)
     
+    # 모델 래퍼 생성
+    model_wrapper = GPT2ModelWrapper(model)
+    model_wrapper = model_wrapper.to(device)
+    
     # 데이터스토어 구축
     from knn_gpt import DataStore
     datastore = DataStore(hidden_size=768, device=device)
     save_path = os.path.join(args.data_dir, f"wikitext_{args.version}_datastore.pt")
     
     datastore.build_from_model_and_data(
-        model=model,
+        model=model_wrapper,
         dataloader=train_dataloader,
         save_path=save_path
     )
@@ -188,7 +234,7 @@ def main():
     
     parser.add_argument("--version", type=str, default='2',
                         choices=['2', '103'])
-    parser.add_argument("--data_dir", type=str, default='data')
+    parser.add_argument("--data_dir", type=str, default='datastores')
     parser.add_argument("--max_length", type=int, default=512)
     parser.add_argument("--batch_size", type=int, default=8,
                         help="배치 크기")

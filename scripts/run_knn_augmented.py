@@ -12,18 +12,24 @@ import sys
 import torch
 import logging
 from typing import Optional, Dict, Any
+import csv
+import json
+from datetime import datetime
+from torch.utils.data import DataLoader
 
-# 프로젝트 루트 디렉토리를 Python path에 추가
-sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
 from knn_gpt import DataStore
 from models.knn_gpt2 import KNNAugmentedGPT2
 from paraphrase_detection import ParaphraseGPT
 from sonnet_generation import SonnetGPT
-from datasets import load_paraphrase_data, SonnetsDataset
+from datasets import (load_paraphrase_data, ParaphraseDetectionDataset, ParaphraseDetectionTestDataset, SonnetsDataset)
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+
+# 결과 저장 디렉토리 생성
+os.makedirs('predictions', exist_ok=True)
 
 
 def load_knn_model(task: str, args: argparse.Namespace) -> KNNAugmentedGPT2:
@@ -74,6 +80,10 @@ def load_knn_model(task: str, args: argparse.Namespace) -> KNNAugmentedGPT2:
             vocab_size=base_model.gpt.word_embedding.num_embeddings
         )
         
+        # SonnetGPT 래퍼에는 tokenizer가 있으나, knn_model은 GPT2Model만 기반이므로 직접 주입한다.
+        if hasattr(base_model, 'tokenizer'):
+            knn_model.tokenizer = base_model.tokenizer
+        
     else:
         raise ValueError(f"지원되지 않는 작업: {task}")
         
@@ -82,18 +92,100 @@ def load_knn_model(task: str, args: argparse.Namespace) -> KNNAugmentedGPT2:
 
 def load_datastore(task: str, args: argparse.Namespace) -> DataStore:
     """데이터스토어 로드"""
+    # 디바이스 설정
+    if args.use_gpu and torch.cuda.is_available():
+        device = torch.device(f'cuda:0')  # 명시적으로 cuda:0 사용
+        logger.info(f"GPU 디바이스 사용: {device}")
+    else:
+        device = torch.device('cpu')
+        logger.info(f"CPU 디바이스 사용: {device}")
+    
     if args.use_wikitext:
         # WikiText 데이터스토어 사용
-        datastore_path = os.path.join(args.data_dir, f"wikitext_{args.wikitext_version}_datastore.pt")
+        datastore_path = os.path.join('datastores', f"wikitext_{args.wikitext_version}_datastore.pt")
     else:
         # 작업별 데이터스토어 사용
-        datastore_path = os.path.join(args.data_dir, f"{task}_datastore.pt")
+        datastore_path = os.path.join('datastores', f"{task}_datastore.pt")
         
     if not os.path.exists(datastore_path):
         raise FileNotFoundError(f"데이터스토어 파일 오류: {datastore_path}")
         
-    datastore = DataStore(hidden_size=768)
-    datastore.load(datastore_path)
+    datastore = DataStore(hidden_size=768, device=device)
+    
+    try:
+        logger.info(f"데이터스토어 로드 중: {datastore_path}")
+        data = torch.load(datastore_path, map_location=device)
+        
+        # 데이터스토어 형식 확인
+        if isinstance(data, dict):
+            if 'keys' in data:
+                # 기본 형식
+                datastore.keys = data['keys'].to(device)
+                datastore.values = data['values'].to(device)
+                datastore.contexts = data.get('contexts', [])
+                datastore.size = data['size']
+                datastore.hidden_size = data['hidden_size']
+                datastore.is_built = data.get('is_built', True)
+                logger.info(f"단일 데이터스토어 로드 완료. 크기: {datastore.size}")
+            elif 'chunk_count' in data:
+                # 청크로 나뉜 형식
+                chunk_count = data['chunk_count']
+                base_path = data['base_path']
+                logger.info(f"청크 데이터스토어 감지: {chunk_count} 청크")
+                
+                # 로드할 최대 청크 수 설정 (메모리 제한 고려)
+                max_chunks = min(chunk_count, args.max_chunks) if hasattr(args, 'max_chunks') and args.max_chunks > 0 else chunk_count
+                logger.info(f"최대 {max_chunks}개 청크를 로드합니다.")
+                
+                all_keys = []
+                all_values = []
+                all_contexts = []
+                total_size = 0
+                
+                # 청크 로드
+                for i in range(max_chunks):
+                    chunk_path = f"{base_path}_chunk{i}.pt"
+                    if os.path.exists(chunk_path):
+                        logger.info(f"청크 {i+1}/{max_chunks} 로드 중: {chunk_path}")
+                        chunk_data = torch.load(chunk_path, map_location=device)
+                        
+                        # 청크 데이터 추가
+                        chunk_keys = chunk_data['keys'].to(device)
+                        chunk_values = chunk_data['values'].to(device)
+                        chunk_contexts = chunk_data.get('contexts', [])
+                        chunk_size = chunk_data['size']
+                        
+                        all_keys.append(chunk_keys)
+                        all_values.append(chunk_values)
+                        all_contexts.extend(chunk_contexts)
+                        total_size += chunk_size
+                        
+                        logger.info(f"청크 {i+1} 로드 완료: 크기 {chunk_size}")
+                    else:
+                        logger.warning(f"청크 파일을 찾을 수 없음: {chunk_path}")
+                
+                # 모든 청크 데이터 결합
+                if all_keys:
+                    datastore.keys = torch.cat(all_keys, dim=0)
+                    datastore.values = torch.cat(all_values, dim=0)
+                    datastore.contexts = all_contexts
+                    datastore.size = total_size
+                    datastore.hidden_size = all_keys[0].shape[1]
+                    datastore.is_built = True
+                    
+                    logger.info(f"총 {max_chunks}개 청크 로드 완료. 총 크기: {total_size}, 형태: {datastore.keys.shape}")
+                else:
+                    raise ValueError("로드된 청크가 없습니다.")
+            else:
+                raise ValueError(f"인식할 수 없는 데이터스토어 형식: {list(data.keys())}")
+        else:
+            raise TypeError(f"데이터스토어가 딕셔너리가 아님: {type(data)}")
+        
+        logger.info(f"데이터스토어 로드 완료. 크기: {datastore.size}")
+    except Exception as e:
+        logger.error(f"데이터스토어 로드 중 오류 발생: {e}")
+        raise
+        
     return datastore
 
 
@@ -103,44 +195,108 @@ def run_paraphrase_detection(args: argparse.Namespace):
     knn_model, base_model = load_knn_model('paraphrase', args)
     
     # 데이터스토어 로드 및 설정
-    datastore = load_datastore('paraphrase', args)
-    knn_model.set_datastore(datastore)
+    try:
+        logger.info("데이터스토어 로드 중...")
+        datastore = load_datastore('paraphrase', args)
+        knn_model.set_datastore(datastore)
+        logger.info("k-NN 검색기가 성공적으로 초기화되었습니다.")
+    except Exception as e:
+        logger.error(f"데이터스토어 로드 중 오류 발생: {e}")
+        raise
     
     # 테스트 데이터 로드
-    test_data = load_paraphrase_data('data/quora-test.csv')
+    try:
+        logger.info("테스트 데이터 로드 중...")
+        test_data = load_paraphrase_data('data/quora-test-student.csv', split='test')
+        test_dataset = ParaphraseDetectionTestDataset(test_data, args)
+        
+        # batch_size가 없는 경우 기본값 설정
+        batch_size = getattr(args, 'batch_size', 8)  # 기본값 8
+        
+        test_dataloader = DataLoader(test_dataset, shuffle=False, batch_size=batch_size,
+                                    collate_fn=test_dataset.collate_fn)
+        logger.info(f"테스트 데이터 로드 완료: {len(test_dataset)} 샘플")
+    except Exception as e:
+        logger.error(f"테스트 데이터 로드 중 오류 발생: {e}")
+        raise
     
     # 평가
     device = torch.device('cuda' if args.use_gpu and torch.cuda.is_available() else 'cpu')
     knn_model = knn_model.to(device)
-    base_model = base_model.to(device)
     
-    # k-NN 활성화/비활성화 비교
-    for use_knn in [False, True]:
-        if use_knn:
-            logger.info("k-NN 증강 모드로 평가 중...")
-            model = knn_model
-        else:
-            logger.info("기본 모드로 평가 중...")
-            model = base_model
+    # 결과 저장을 위한 딕셔너리
+    results = {
+        'knn_model': {'predictions': []}
+    }
+    
+    # kNN 모델 평가
+    logger.info("k-NN 증강 모드로 평가 중...")
+    model = knn_model
+    model.eval()
+    predictions = []
+    sent_ids = []
+    
+    with torch.no_grad():
+        for batch in test_dataloader:
+            b_ids, b_mask = batch['token_ids'], batch['attention_mask']
+            b_sent_ids = batch['sent_ids']
             
-        model.eval()
-        correct = 0
-        total = 0
-        
-        with torch.no_grad():
-            for batch in test_data:
-                input_ids = batch['input_ids'].to(device)
-                attention_mask = batch['attention_mask'].to(device)
-                labels = batch['labels'].to(device)
+            b_ids = b_ids.to(device)
+            b_mask = b_mask.to(device)
+            
+            try:
+                outputs = model(b_ids, b_mask)
+                logits = outputs['logits']
                 
-                outputs = model(input_ids, attention_mask)
-                predictions = torch.argmax(outputs['logits'], dim=-1)
+                preds = torch.argmax(logits, dim=1)
                 
-                correct += (predictions == labels).sum().item()
-                total += labels.size(0)
+                # 예측 결과와 문장 ID 저장
+                predictions.extend(preds.cpu().numpy().tolist())
+                sent_ids.extend(b_sent_ids)
+            except RuntimeError as e:
+                logger.error(f"예측 중 오류 발생: {e}")
+                if "Expected all tensors to be on the same device" in str(e):
+                    logger.info(f"텐서 디바이스 불일치 감지. 현재 디바이스: {device}")
+                    logger.info(f"모델 디바이스: {next(model.parameters()).device}")
+                    logger.info(f"데이터스토어 디바이스: {datastore.device}")
+                    logger.info(f"데이터스토어 키 디바이스: {datastore.keys.device}")
                 
-        accuracy = correct / total
-        logger.info(f"{'k-NN 증강' if use_knn else '기본'} 모드 정확도: {accuracy:.4f}")
+                # 오류 발생 시 해당 배치 건너뛰기
+                logger.warning(f"배치 처리 중 오류 발생. 해당 배치를 건너뜁니다.")
+                continue
+    
+    # 예측 완료 로그
+    logger.info(f"k-NN 증강 모드 예측 완료: {len(predictions)} 샘플")
+    
+    # 결과 저장
+    results['knn_model']['predictions'] = list(zip(sent_ids, predictions))
+    
+    # 결과 파일로 저장
+    datastore_type = 'wikitext' if args.use_wikitext else 'default'
+    
+    # kNN 모델 결과 저장
+    knn_output_file = f'predictions/knn_para-test-output_{datastore_type}_k{args.k}.csv'
+    with open(knn_output_file, "w+", newline='') as f:
+        writer = csv.writer(f)
+        writer.writerow(["id", "Predicted_Is_Paraphrase"])
+        for sent_id, pred in results['knn_model']['predictions']:
+            writer.writerow([sent_id, pred])
+    logger.info(f"k-NN 모델 결과를 {knn_output_file}에 저장했습니다.")
+    
+    # 파라미터 정보 저장
+    params_file = f'predictions/knn_para_params_{datastore_type}_k{args.k}.json'
+    with open(params_file, "w+") as f:
+        json.dump({
+            'parameters': {
+                'k': args.k,
+                'lambda_knn': args.lambda_knn,
+                'knn_temperature': args.knn_temperature,
+                'use_quality_filter': args.use_quality_filter,
+                'use_adaptive_interpolation': args.use_adaptive_interpolation,
+                'datastore_type': datastore_type
+            }
+        }, f, indent=2)
+    logger.info(f"파라미터 정보를 {params_file}에 저장했습니다.")
 
 
 def run_sonnet_generation(args: argparse.Namespace):
@@ -149,41 +305,38 @@ def run_sonnet_generation(args: argparse.Namespace):
     knn_model, base_model = load_knn_model('sonnet', args)
     
     # 데이터스토어 로드 및 설정
-    datastore = load_datastore('sonnet', args)
-    knn_model.set_datastore(datastore)
+    try:
+        logger.info("데이터스토어 로드 중...")
+        datastore = load_datastore('sonnet', args)
+        knn_model.set_datastore(datastore)
+        logger.info("k-NN 검색기가 성공적으로 초기화되었습니다.")
+    except Exception as e:
+        logger.error(f"데이터스토어 로드 중 오류 발생: {e}")
+        raise
     
-    # 토크나이저
+    # 토크나이저 (위에서 주입한 것을 그대로 사용)
     tokenizer = base_model.tokenizer
     
-    # 시작 프롬프트
-    prompts = [
-        "Shall I compare thee to a summer's day?",
-        "My mistress' eyes are nothing like the sun",
-        "When I do count the clock that tells the time"
-    ]
+    # 평가용 held-out 소넷 데이터셋 로드 (전체 행을 prompt 로 사용)
+    held_out_path = getattr(args, 'held_out_path', 'data/sonnets_held_out.txt')
+    held_out_dataset = SonnetsDataset(held_out_path)
     
+    # 디바이스 설정 후 모델 이동
     device = torch.device('cuda' if args.use_gpu and torch.cuda.is_available() else 'cpu')
     knn_model = knn_model.to(device)
-    base_model = base_model.to(device)
     
-    # k-NN 활성화/비활성화 비교
-    for use_knn in [False, True]:
-        if use_knn:
-            logger.info("\nk-NN 증강 모드로 생성 중...")
-            model = knn_model
-        else:
-            logger.info("\n기본 모드로 생성 중...")
-            model = base_model
-            
-        model.eval()
-        
-        for prompt in prompts:
-            # 입력 토큰화
-            inputs = tokenizer(prompt, return_tensors='pt')
+    results = []
+
+    logger.info("\nk-NN 증강 모드로 held-out 소넷 생성 중...")
+    model = knn_model
+    model.eval()
+
+    for (sid, sonnet_prompt) in held_out_dataset:
+        try:
+            inputs = tokenizer(sonnet_prompt, return_tensors='pt', padding=False, truncation=True)
             input_ids = inputs['input_ids'].to(device)
             attention_mask = inputs['attention_mask'].to(device)
-            
-            # 텍스트 생성
+
             generated_ids, generated_text = model.generate(
                 input_ids=input_ids,
                 attention_mask=attention_mask,
@@ -192,9 +345,26 @@ def run_sonnet_generation(args: argparse.Namespace):
                 top_p=args.top_p,
                 do_sample=args.do_sample
             )
-            
-            logger.info(f"\n프롬프트: {prompt}")
-            logger.info(f"생성된 텍스트:\n{generated_text}")
+
+            logger.info(f"[{sid}] 생성 완료")
+
+            results.append({
+                'id': sid,  # 유지: SonnetsDataset는 0-based ID를 그대로 사용
+                'generated_text': generated_text.strip()
+            })
+        except Exception as e:
+            logger.error(f"소넷 {sid} 생성 중 오류: {e}")
+            continue
+
+    # 평가 스크립트에서 기대하는 동일 형식으로 저장
+    output_file = 'predictions/knn_generated_sonnets.txt'
+    with open(output_file, 'w', encoding='utf-8') as f:
+        f.write('--Generated Sonnets-- \n\n')
+        for res in results:
+            f.write(f"\n{res['id']}\n")
+            f.write(res['generated_text'] + "\n\n")
+
+    logger.info(f"k-NN 모델 생성 결과를 {output_file} 에 저장했습니다.")
 
 
 def main():
@@ -227,12 +397,16 @@ def main():
                         help="WikiText 버전")
     parser.add_argument("--data_dir", type=str, default='data',
                         help="데이터 디렉토리")
+    parser.add_argument("--max_chunks", type=int, default=3,
+                        help="로드할 최대 청크 수 (기본값: 3, 메모리 제한 고려)")
     
     # 모델 관련 인수
     parser.add_argument("--epochs", type=int, default=10,
                         help="훈련 에포크 수")
     parser.add_argument("--lr", type=float, default=1e-5,
                         help="학습률")
+    parser.add_argument("--batch_size", type=int, default=8,
+                        help="배치 크기")
     
     # 생성 관련 인수 (sonnet 작업에만 사용)
     parser.add_argument("--max_length", type=int, default=200,

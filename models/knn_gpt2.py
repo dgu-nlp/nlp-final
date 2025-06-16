@@ -28,7 +28,8 @@ class KNNAugmentedGPT2(nn.Module):
                  knn_temperature: float = 10.0,
                  use_quality_filter: bool = True,
                  use_adaptive_interpolation: bool = False,
-                 vocab_size: int = 50257):
+                 vocab_size: int = 50257,
+                 device: Optional[torch.device] = None):
         """
         Args:
             base_model: 기본 GPT-2 모델
@@ -39,6 +40,7 @@ class KNNAugmentedGPT2(nn.Module):
             use_quality_filter: 품질 필터링 사용 여부
             use_adaptive_interpolation: 적응적 interpolation 사용 여부
             vocab_size: 어휘 크기
+            device: 디바이스
         """
         super().__init__()
         
@@ -65,6 +67,10 @@ class KNNAugmentedGPT2(nn.Module):
         if datastore is not None:
             self.initialize_retriever(knn_temperature)
             
+        self.device = device or torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        
+        self.tokenizer = getattr(base_model, 'tokenizer', None)
+        
     def initialize_retriever(self, temperature: float = 10.0):
         """k-NN 검색기 초기화"""
         if self.datastore is None or not self.datastore.is_built:
@@ -74,14 +80,27 @@ class KNNAugmentedGPT2(nn.Module):
             datastore=self.datastore,
             k=self.k,
             temperature=temperature,
-            use_faiss=True
+            use_faiss=True,
+            device=self.device
         )
         logger.info("k-NN 검색기가 초기화되었습니다.")
         
-    def set_datastore(self, datastore: DataStore, temperature: float = 10.0):
+    def set_datastore(self, datastore):
         """데이터스토어 설정"""
         self.datastore = datastore
-        self.initialize_retriever(temperature)
+        
+        # 디바이스 확인 및 조정
+        if hasattr(self, 'device') and hasattr(datastore, 'device') and datastore.device != self.device:
+            logger.warning(f"데이터스토어 디바이스({datastore.device})와 모델 디바이스({self.device})가 다릅니다.")
+            logger.info(f"데이터스토어를 {self.device}로 이동합니다.")
+            datastore.device = self.device
+            if hasattr(datastore, 'keys') and isinstance(datastore.keys, torch.Tensor):
+                datastore.keys = datastore.keys.to(self.device)
+            if hasattr(datastore, 'values') and isinstance(datastore.values, torch.Tensor):
+                datastore.values = datastore.values.to(self.device)
+        
+        # k-NN 검색기 초기화
+        self.initialize_retriever()
         
     def forward(self, 
                 input_ids: torch.Tensor, 
@@ -230,7 +249,21 @@ class KNNAugmentedGPT2(nn.Module):
             for _ in range(max_length):
                 # Forward pass
                 outputs = self.forward(generated_ids, current_attention_mask)
-                next_token_logits = outputs['logits'][:, -1, :] / temperature
+                # outputs['logits'] can be either 2D ([batch, vocab]) or 3D ([batch, seq_len, vocab]).
+                logits_tensor = outputs['logits']
+                if logits_tensor.dim() == 3:
+                    # Standard case when logits are provided for each timestep.
+                    next_token_logits = logits_tensor[:, -1, :] / temperature
+                elif logits_tensor.dim() == 2:
+                    # k-NN forward returns only the last-token logits (batch, vocab)
+                    next_token_logits = logits_tensor / temperature
+                else:
+                    raise ValueError(f"Unexpected logits dimension: {logits_tensor.dim()}")
+                
+                # EOS 토큰은 첫 토큰으로 뽑히지 않도록 확률을 -Inf 로 마스킹
+                if getattr(self, 'tokenizer', None) is not None:
+                    eos_id = self.tokenizer.eos_token_id
+                    next_token_logits[:, eos_id] = -float('Inf')
                 
                 if do_sample:
                     # Top-p (nucleus) sampling
@@ -253,10 +286,16 @@ class KNNAugmentedGPT2(nn.Module):
                     # Greedy sampling
                     next_token = torch.argmax(next_token_logits, dim=-1, keepdim=True)
                 
-                # Check for EOS token
-                if hasattr(self.base_model, 'tokenizer'):
-                    if next_token.item() == self.base_model.tokenizer.eos_token_id:
-                        break
+                # EOS 토큰 여부 확인 (base_model 또는 self에 tokenizer가 있을 수 있음)
+                eos_id = None
+                # 우선 base_model에 유효한 tokenizer가 있는지 확인
+                if hasattr(self.base_model, 'tokenizer') and self.base_model.tokenizer is not None:
+                    eos_id = self.base_model.tokenizer.eos_token_id
+                # 그 외 self.tokenizer 사용 (주입된 경우)
+                elif getattr(self, 'tokenizer', None) is not None:
+                    eos_id = self.tokenizer.eos_token_id
+                if eos_id is not None and next_token.item() == eos_id:
+                    break
                 
                 # Append generated token
                 generated_ids = torch.cat([generated_ids, next_token], dim=-1)
@@ -267,9 +306,14 @@ class KNNAugmentedGPT2(nn.Module):
                               dtype=current_attention_mask.dtype)
                 ], dim=-1)
         
-        # Decode generated text
-        if hasattr(self.base_model, 'tokenizer'):
+        # 결과 디코딩 (가능한 tokenizer 사용)
+        if hasattr(self.base_model, 'tokenizer') and self.base_model.tokenizer is not None:
             generated_text = self.base_model.tokenizer.decode(
+                generated_ids[0].cpu().tolist(), 
+                skip_special_tokens=True
+            )
+        elif getattr(self, 'tokenizer', None) is not None:
+            generated_text = self.tokenizer.decode(
                 generated_ids[0].cpu().tolist(), 
                 skip_special_tokens=True
             )
