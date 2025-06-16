@@ -14,8 +14,7 @@ from torch.utils.data import DataLoader
 import logging
 import pickle
 
-# 프로젝트 루트 디렉토리를 Python path에 추가
-sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
 from knn_gpt import DataStore
 from models.gpt2 import GPT2Model
