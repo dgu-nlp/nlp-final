@@ -55,7 +55,8 @@ def load_knn_model(task: str, args: argparse.Namespace) -> KNNAugmentedGPT2:
             knn_temperature=args.knn_temperature,
             use_quality_filter=args.use_quality_filter,
             use_adaptive_interpolation=args.use_adaptive_interpolation,
-            vocab_size=base_model.gpt.word_embedding.num_embeddings
+            vocab_size=base_model.gpt.word_embedding.num_embeddings,
+            device=device
         )
         
     elif task == 'sonnet':
@@ -77,7 +78,8 @@ def load_knn_model(task: str, args: argparse.Namespace) -> KNNAugmentedGPT2:
             knn_temperature=args.knn_temperature,
             use_quality_filter=args.use_quality_filter,
             use_adaptive_interpolation=args.use_adaptive_interpolation,
-            vocab_size=base_model.gpt.word_embedding.num_embeddings
+            vocab_size=base_model.gpt.word_embedding.num_embeddings,
+            device=device
         )
         
         # SonnetGPT 래퍼에는 tokenizer가 있으나, knn_model은 GPT2Model만 기반이므로 직접 주입한다.

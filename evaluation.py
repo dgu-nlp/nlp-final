@@ -30,7 +30,12 @@ def model_eval_paraphrase(dataloader, model, device):
     b_ids = b_ids.to(device)
     b_mask = b_mask.to(device)
 
-    logits = model(b_ids, b_mask).cpu().numpy()
+    # 일부 모델(e.g., KNNAugmentedGPT2)은 dict을 반환하고, token-level logits는 'logits' 키에 저장된다.
+    _out = model(b_ids, b_mask)
+    if isinstance(_out, dict):  # k-NN 증강 모델 등
+      _out = _out['logits']
+
+    logits = _out.cpu().numpy()
     preds = np.argmax(logits, axis=1).flatten()
 
     y_true.extend(labels)
@@ -53,7 +58,12 @@ def model_test_paraphrase(dataloader, model, device):
     b_ids = b_ids.to(device)
     b_mask = b_mask.to(device)
 
-    logits = model(b_ids, b_mask).cpu().numpy()
+    # 일부 모델(e.g., KNNAugmentedGPT2)은 dict을 반환하고, token-level logits는 'logits' 키에 저장된다.
+    _out = model(b_ids, b_mask)
+    if isinstance(_out, dict):
+      _out = _out['logits']
+
+    logits = _out.cpu().numpy()
     preds = np.argmax(logits, axis=1).flatten()
 
     y_pred.extend(preds)
@@ -80,7 +90,7 @@ def test_sonnet(
     return float(chrf_score.score)
 
 def test_sonnet_dev(
-    test_path='predictions/generated_sonnets.txt',
+    test_path='predictions/knn_generated_sonnets.txt',
     gold_path='data/TRUE_sonnets_held_out_dev.txt'
 ):
     chrf = CHRF()
