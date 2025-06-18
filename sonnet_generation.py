@@ -98,14 +98,13 @@ class SonnetGPT(nn.Module):
       # Convert logits to probabilities
       probs = torch.nn.functional.softmax(logits_last_token, dim=-1)
 
-      # Top-p (nucleus) sampling
+      # Top-p (nucleus) sampling : 간결하고 안전한 구현
       sorted_probs, sorted_indices = torch.sort(probs, descending=True)
       cumulative_probs = torch.cumsum(sorted_probs, dim=-1)
       top_p_mask = cumulative_probs <= top_p
-      top_p_mask[..., 1:] = top_p_mask[..., :-1].clone()  # Shift mask right for proper thresholding
-      top_p_mask[..., 0] = True  # Always include the highest probability token
-      filtered_probs = sorted_probs * top_p_mask  # Zero out unlikely tokens
-      filtered_probs /= filtered_probs.sum(dim=-1, keepdim=True)  # Normalize probabilities
+      top_p_mask[..., 0] = True  # 최소 한 개 토큰 보장
+      filtered_probs = sorted_probs.masked_fill(~top_p_mask, 0.0)
+      filtered_probs = filtered_probs / filtered_probs.sum(dim=-1, keepdim=True)
 
       # Sample from filtered distribution
       sampled_index = torch.multinomial(filtered_probs, 1)
@@ -121,7 +120,10 @@ class SonnetGPT(nn.Module):
         [attention_mask, torch.ones((1, 1), dtype=torch.int64).to(self.get_device())], dim=1
       )
 
-    generated_output = self.tokenizer.decode(token_ids[0].cpu().numpy().tolist())[3:]
+    generated_output = self.tokenizer.decode(
+      token_ids[0].cpu().tolist(),
+      skip_special_tokens=True,
+    )
     return token_ids, generated_output
 
 
@@ -173,8 +175,16 @@ def train(args):
       logits = model(b_ids, b_mask)
       logits = rearrange(logits[:, :-1].contiguous(), 'b t d -> (b t) d')  # 시퀀스의 마지막 예측은 무시한다.
       labels = b_ids[:, 1:].contiguous().flatten()  # 레이블을 구성하기 위해 첫번째 토큰을 무시한다.
-      loss = F.cross_entropy(logits, labels, reduction='mean')
+      # pad 토큰(hand-crafted EOS)을 무시하여 실제 단어 토큰만 학습하도록 한다.
+      loss = F.cross_entropy(
+        logits,
+        labels,
+        reduction='mean',
+        ignore_index=model.tokenizer.pad_token_id,
+      )
       loss.backward()
+      # 그래디언트 폭발을 방지하기 위한 gradient clipping.
+      torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
       optimizer.step()
 
       train_loss += loss.item()
