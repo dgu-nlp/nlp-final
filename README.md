@@ -27,9 +27,11 @@ Urvashi Khandelwal et.al의 knn-lm논문을 이용하여 기본과제와 knn-gpt
 >[!note]
 >결과로, 기본적인 sonnet_generation.py는 **28.26**
 >
->knn을 이용한 sonnet_generation.py는 **30.14**
+>knn을 이용한 sonnet_generation은 **30.14**
 >
->기본적인 paraphrase_detectionpy는 **0.868**의 dev acc 결과를 얻었습니다.
+>기본적인 paraphrase_detection.py는 **0.868**의 dev acc 결과를 얻었습니다.
+>
+>knn을 이용한 paraphrase_detection은 **0.8968**의 dev acc 결과를 얻었습니다.
 
 ## 환경 구성 및 실행
 
@@ -77,6 +79,9 @@ python scripts/run_knn_augmented.py --task paraphrase --use_gpu --k 8 --max_chun
 
 # 패러프레이즈 탐지 (WikiText 데이터스토어 사용)
 python scripts/run_knn_augmented.py --task paraphrase --use_gpu --k 8 --max_chunks 8 --wikitext_version 2
+
+# 패러프레이즈 탐지(dev acc 평가)
+python eval_knn_para.py --k 8 --use_gpu  
 
 # 소넷 생성 (기본 데이터스토어 사용)
 python scripts/run_knn_augmented.py \
